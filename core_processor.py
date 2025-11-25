@@ -827,14 +827,18 @@ class CoreProcessor:
         cleaned = text.replace("\ufeff", "")
         cleaned = cleaned.lstrip()
         cleaned = self._strip_preface_before_marker(cleaned)
+        # 额外去除清洗后可能残留的开头分隔线（---）
+        # 允许 BOM (\ufeff) 与 ZWSP (\u200b) 在分隔线两侧
+        cleaned = re.sub(r'(?m)\A(?:[\s\ufeff\u200b]*-{3,}[\s\ufeff\u200b]*\r?\n)+', '', cleaned)
         return cleaned
 
-    def _strip_preface_before_marker(self, text: str, max_preface_chars: int = 200) -> str:
+    def _strip_preface_before_marker(self, text: str, max_preface_chars: int = 300) -> str:
         """
         如果在开头检测到短小客套语且后面紧跟 Markdown 分隔线（---），
         仅在安全条件下移除前缀，避免误删正文。
         """
-        marker_match = re.search(r'(?m)^[ \t]*---[ \t]*$', text)
+        # 更健壮地匹配分隔线，允许 Unicode 隐藏空白（如 BOM/ZWSP）在两侧
+        marker_match = re.search(r'(?m)^[\s\ufeff\u200b]*-{3,}[\s\ufeff\u200b]*$', text)
         if not marker_match:
             return text
 
@@ -843,10 +847,11 @@ class CoreProcessor:
 
         preface = text[:marker_match.start()].strip()
         if not preface:
-            return text[marker_match.start():].lstrip("\r\n")
+            # 如果没有前缀（直接以 --- 开头），去掉分隔线并返回后续内容
+            return text[marker_match.end():].lstrip("\r\n")
 
         # 仅移除很短且不包含结构性 Markdown 的前缀
-        if len(preface) > 120:
+        if len(preface) > 400:
             return text
 
         if preface.count("\n") > 2:
@@ -855,7 +860,7 @@ class CoreProcessor:
         if re.search(r'#{1,6}\s|---|```', preface):
             return text
 
-        return text[marker_match.start():].lstrip("\r\n")
+        return text[marker_match.end():].lstrip("\r\n")
 
     def _generate_note(self, contents):
         """
@@ -928,6 +933,8 @@ class CoreProcessor:
             logger.info(f"🔗 检测到分隔符位置: {separator_index}，去除重复部分")
             # 从分隔符之前开始保留（包含分隔符）
             cleaned_second = second_part[separator_index:]
+            # 如果续写段落以 --- 开头，去掉这些分隔线以免残留
+            cleaned_second = re.sub(r'(?m)\A(?:[ \t]*-{3,}[ \t]*\r?\n)+', '', cleaned_second)
             return first_part + "\n\n" + cleaned_second
         
         # 策略3：查找明确的章节标题（# 5.3 或 ## 5.3 或 ### 等）
