@@ -319,8 +319,7 @@
         headerTitle.innerHTML = `
             <span style="font-size: 20px;">🤖</span>
             <div>
-                <div style="font-weight: 700; font-size: 15px; line-height: 1.2;">AI 学习助手</div>
-                <div style="font-size: 10px; opacity: 0.9; margin-top: 2px;">Intelligent Study Assistant</div>
+                <div style="font-weight: 700; font-size: 15px; line-height: 1.2;">Notes Helper</div>
             </div>
         `;
 
