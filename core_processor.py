@@ -9,23 +9,34 @@ import re
 import uuid
 import shutil
 from pathlib import Path
+
+# 导入通用工具模块（自动加载 .env）
+from utils import (
+    load_dotenv, get_config, setup_logging,
+    sanitize_filename, parse_course_metadata,
+    clean_model_output, strip_preface_before_marker,
+    get_ffmpeg_headers, DEFAULT_HEADERS, ensure_dir
+)
+
+# 配置日志和编码
+setup_logging()
+
 import google.generativeai as genai
 from transcriber import transcribe_audio
 
 # ================= 配置区域 =================
-OBSIDIAN_VAULT_PATH = r"D:\OneDrive\Obsidian"
-# 使用环境变量或硬编码 Key
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-TEMP_DIR = "temp_downloads"
-DOWNLOAD_DIR = r"D:\Download\SJTU_Courses"
+OBSIDIAN_VAULT_PATH = get_config("OBSIDIAN_VAULT_PATH", r"D:\OneDrive\Obsidian")
+GOOGLE_API_KEY = get_config("GOOGLE_API_KEY", "")
+TEMP_DIR = get_config("TEMP_DIR", "temp_downloads")
+DOWNLOAD_DIR = get_config("DOWNLOAD_DIR", r"D:\Download\SJTU_Courses")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Referer": "https://courses.sjtu.edu.cn/",
-    "Origin": "https://courses.sjtu.edu.cn"
-}
+HEADERS = DEFAULT_HEADERS
 
 MAX_TRANSCRIPT_CHARS = 100000000000
+
+FFMPEG_RW_TIMEOUT_US = int(get_config("FFMPEG_RW_TIMEOUT_US", 120_000_000))  # 120s
+FFMPEG_MAX_RETRIES = int(get_config("FFMPEG_MAX_RETRIES", 4))
+DISABLE_PROXY_FOR_FFMPEG = get_config("DISABLE_PROXY_FOR_FFMPEG", "1") not in {"0", "false", "False"}
 
 # ================= 通用学术笔记 Prompt (适配音频输入) =================
 SYSTEM_PROMPT = """
@@ -714,6 +725,46 @@ graph TD
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def cleanup_tmp_files(directory: str, extensions: list = None) -> int:
+    """
+    清理指定目录下的临时文件（.tmp 后缀）。
+    
+    Args:
+        directory: 要清理的目录
+        extensions: 可选，只清理这些扩展名的临时文件，如 ['.m4a', '.srt', '.txt', '.md']
+    
+    Returns:
+        清理的文件数量
+    """
+    if not directory or not os.path.isdir(directory):
+        return 0
+    
+    count = 0
+    try:
+        for filename in os.listdir(directory):
+            if filename.endswith('.tmp'):
+                # 如果指定了扩展名过滤
+                if extensions:
+                    base_name = filename[:-4]  # 去掉 .tmp
+                    if not any(base_name.endswith(ext) for ext in extensions):
+                        continue
+                
+                filepath = os.path.join(directory, filename)
+                try:
+                    os.remove(filepath)
+                    logger.debug(f"已清理临时文件: {filepath}")
+                    count += 1
+                except OSError as e:
+                    logger.warning(f"清理临时文件失败 {filepath}: {e}")
+    except OSError as e:
+        logger.warning(f"遍历目录失败 {directory}: {e}")
+    
+    if count > 0:
+        logger.info(f"已清理 {count} 个临时文件 (目录: {directory})")
+    return count
+
+
 class CoreProcessor:
     def __init__(self):
         genai.configure(api_key=GOOGLE_API_KEY)
@@ -722,42 +773,230 @@ class CoreProcessor:
             system_instruction="你是一位专业的多模态学术助教，严格按照用户指定的 Markdown 结构输出，突出逻辑与核心概念。"
         )
         logger.info("已强制使用 google.generativeai + Gemini 3 Pro")
+        
+        # 启动时清理残留的临时文件
+        self._cleanup_residual_tmp_files()
+
+    def _cleanup_residual_tmp_files(self):
+        """清理各目录中残留的临时文件"""
+        dirs_to_clean = [DOWNLOAD_DIR, TEMP_DIR]
+        
+        # 也清理 Obsidian 目录下的临时文件
+        if os.path.isdir(OBSIDIAN_VAULT_PATH):
+            for item in os.listdir(OBSIDIAN_VAULT_PATH):
+                subdir = os.path.join(OBSIDIAN_VAULT_PATH, item)
+                if os.path.isdir(subdir):
+                    dirs_to_clean.append(subdir)
+        
+        total = 0
+        for d in dirs_to_clean:
+            total += cleanup_tmp_files(d)
+        
+        if total > 0:
+            logger.info(f"启动清理完成，共清理 {total} 个残留临时文件")
 
     def get_ffmpeg_headers(self):
-        return "".join([f"{k}: {v}\r\n" for k, v in HEADERS.items()])
+        """生成 ffmpeg headers（复用 utils）"""
+        return get_ffmpeg_headers(HEADERS)
 
     def sanitize_filename(self, name):
-        return re.sub(r'[\\/*?:"<>|]', "", name)
+        """清理文件名（复用 utils）"""
+        return sanitize_filename(name)
 
     def parse_metadata(self, course_name, lesson_title):
-        course = course_name.split('(')[0].strip() if '(' in course_name else course_name.strip()
-        date_pattern = r'(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})'
-        match = re.search(date_pattern, lesson_title)
-        
-        if match:
-            year, month, day, hour, minute = match.groups()
-            formatted_name = f"{course}-{month}{day}-{hour}{minute}"
-        else:
-            formatted_name = f"{course}-{int(time.time())}"
-        
-        return self.sanitize_filename(formatted_name)
+        """解析课程元数据（复用 utils）"""
+        return parse_course_metadata(course_name, lesson_title)
 
-    def download_media(self, url, output_path, audio_only=False):
-        try:
-            logger.info(f"开始下载: {url} -> {output_path}")
-            cmd = ['ffmpeg', '-y', '-headers', self.get_ffmpeg_headers(), '-i', url]
+    def check_existing_files(self, course_name, lesson_title):
+        """
+        检测已存在的文件，返回各步骤的完成状态。
+        用于 run_full_workflow 智能跳过已完成的步骤。
+        
+        注意：只检测正式文件，忽略 .tmp 临时文件。
+        
+        Returns:
+            dict: {
+                'formatted_name': str,
+                'audio_path': str or None,       # 音频文件路径（如存在且完整）
+                'audio_complete': bool,          # 音频是否下载完整（>1MB）
+                'subtitle_path': str or None,    # 字幕文件路径（优先 txt）
+                'transcript_text': str or None,  # 字幕文本内容
+                'note_path': str or None,        # 笔记路径（如存在）
+                'note_exists': bool,             # 笔记是否已存在
+            }
+        """
+        formatted_name = self.parse_metadata(course_name, lesson_title)
+        course_dir = Path(OBSIDIAN_VAULT_PATH) / self.sanitize_filename(course_name)
+        
+        result = {
+            'formatted_name': formatted_name,
+            'audio_path': None,
+            'audio_complete': False,
+            'subtitle_path': None,
+            'transcript_text': None,
+            'note_path': None,
+            'note_exists': False,
+        }
+        
+        # 检查音频（可能在 TEMP_DIR 或 DOWNLOAD_DIR）
+        for base_dir in [TEMP_DIR, DOWNLOAD_DIR]:
+            audio_path = Path(base_dir) / f"{formatted_name}.m4a"
+            if audio_path.exists():
+                try:
+                    audio_size = audio_path.stat().st_size
+                    if audio_size > 1024 * 1024:  # > 1MB 认为完整
+                        result['audio_path'] = str(audio_path)
+                        result['audio_complete'] = True
+                        break
+                except OSError:
+                    pass
+        
+        # 检查字幕（优先 txt，其次 srt）- 只在 DOWNLOAD_DIR 和 TEMP_DIR 查找
+        # 字幕文件应该和音频在同一目录，不应该在 Obsidian 笔记目录
+        for base_dir in [DOWNLOAD_DIR, TEMP_DIR]:
+            txt_path = Path(base_dir) / f"{formatted_name}.txt"
+            srt_path = Path(base_dir) / f"{formatted_name}.srt"
             
-            if audio_only:
-                cmd.extend(['-vn', '-acodec', 'copy', '-bsf:a', 'aac_adtstoasc'])
-            else:
-                cmd.extend(['-c', 'copy', '-bsf:a', 'aac_adtstoasc'])
+            if txt_path.exists():
+                result['subtitle_path'] = str(txt_path)
+                try:
+                    with open(txt_path, 'r', encoding='utf-8') as f:
+                        result['transcript_text'] = f.read()
+                except Exception:
+                    pass
+                break
+            elif srt_path.exists():
+                result['subtitle_path'] = str(srt_path)
+                try:
+                    with open(srt_path, 'r', encoding='utf-8') as f:
+                        result['transcript_text'] = f.read()
+                except Exception:
+                    pass
+                break
+        
+        # 检查笔记（笔记在 Obsidian 目录）
+        note_path = course_dir / f"{formatted_name}.md"
+        if note_path.exists():
+            result['note_path'] = str(note_path)
+            result['note_exists'] = True
+        
+        return result
 
-            cmd.append(output_path)
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.error(f"下载失败: {e}")
-            return False
+    def download_media(self, url, output_path, audio_only=False, max_retries=None):
+        """使用 ffmpeg 下载媒体，遵循官方 HTTP/HTTPS 协议参数并输出详细日志。
+
+        下载流程：先下载到临时文件 (.tmp)，成功后再重命名为正式文件。
+        参考: https://ffmpeg.org/ffmpeg-protocols.html#http
+        """
+        logger.info(f"开始下载: {url} -> {output_path}")
+
+        if max_retries is None:
+            max_retries = FFMPEG_MAX_RETRIES
+
+        output_path_obj = Path(output_path)
+        if output_path_obj.suffix:
+            tmp_filename = f"{output_path_obj.stem}.tmp{output_path_obj.suffix}"
+        else:
+            tmp_filename = output_path_obj.name + '.tmp'
+        tmp_path = str(output_path_obj.with_name(tmp_filename))
+        
+        # 清理可能存在的残留临时文件
+        tmp_path_obj = Path(tmp_path)
+        if tmp_path_obj.exists():
+            tmp_path_obj.unlink()
+            logger.debug(f"清理残留临时文件: {tmp_path}")
+
+        base_cmd = [
+            'ffmpeg', '-y', '-hide_banner',
+            '-nostdin',
+            '-loglevel', 'warning',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+            '-reconnect_at_eof', '1',
+            '-reconnect_on_network_error', '1',
+            '-reconnect_on_http_error', '4xx,5xx',
+            '-rw_timeout', str(FFMPEG_RW_TIMEOUT_US),
+            '-fflags', '+genpts+discardcorrupt',
+            '-analyzeduration', '2000000',
+            '-probesize', '2000000',
+            '-threads', '4',
+            '-user_agent', DEFAULT_HEADERS.get('User-Agent', 'Mozilla/5.0'),
+            '-referer', 'https://courses.sjtu.edu.cn/',
+            '-headers', self.get_ffmpeg_headers(),
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,httpproxy',
+            '-i', url,
+        ]
+
+        stream_opts = [
+            '-vn', '-acodec', 'copy', '-bsf:a', 'aac_adtstoasc'
+        ] if audio_only else [
+            '-c', 'copy', '-bsf:a', 'aac_adtstoasc'
+        ]
+
+        errors = []
+        env = os.environ.copy()
+        if DISABLE_PROXY_FOR_FFMPEG:
+            proxy_keys = [
+                'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+                'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'
+            ]
+            removed = False
+            for key in proxy_keys:
+                if key in env:
+                    env.pop(key)
+                    removed = True
+            env['NO_PROXY'] = '*'
+            if removed:
+                logger.info("ffmpeg 下载已禁用代理环境变量")
+
+        for attempt in range(1, max_retries + 1):
+            cmd = base_cmd + stream_opts + [tmp_path]  # 下载到临时文件
+            logger.debug("ffmpeg 命令(%d/%d): %s", attempt, max_retries, ' '.join(cmd))
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=env,
+            )
+
+            if proc.returncode == 0:
+                if proc.stderr:
+                    logger.debug("ffmpeg 输出: %s", proc.stderr.strip())
+                # 下载成功，重命名为正式文件
+                try:
+                    if output_path_obj.exists():
+                        output_path_obj.unlink()  # 覆盖已有文件
+                    tmp_path_obj.rename(output_path_obj)
+                    logger.info(f"下载完成: {output_path}")
+                    return True
+                except OSError as e:
+                    logger.error(f"重命名临时文件失败: {e}")
+                    return False
+
+            error_text = (proc.stderr or proc.stdout or '').strip()
+            errors.append(error_text)
+            logger.error("下载失败 (第%d次, rc=%s): %s", attempt, proc.returncode, error_text or '无详细输出')
+
+            lower_error = (error_text or '').lower()
+            if 'moov atom not found' in lower_error:
+                logger.warning("⚠️ 检测到 'moov atom not found'，通常意味着链接已过期或网络在下载末尾中断，建议刷新课程链接后重试。")
+            if 'error number -138' in lower_error or 'pull function' in lower_error:
+                logger.warning("⚠️ TLS 连接被对端重置（Error -138）。若多次出现，请检查代理/网络或尝试重新获取链接。")
+
+            # 清理失败的临时文件
+            if tmp_path_obj.exists():
+                tmp_path_obj.unlink()
+
+            if attempt < max_retries:
+                backoff = min(4, attempt * 2)
+                time.sleep(backoff)
+
+        if errors:
+            logger.error("ffmpeg 最终失败: %s", errors[-1])
+        return False
 
     def process_with_gemini(self, audio_path, transcript_text=None):
         """
@@ -820,52 +1059,20 @@ class CoreProcessor:
         return text
 
     def _clean_model_output(self, text: str) -> str:
-        """Remove BOM/空白并在安全条件下清理AI的客套前缀。"""
-        if not text:
-            return ""
-
-        cleaned = text.replace("\ufeff", "")
-        cleaned = cleaned.lstrip()
-        cleaned = self._strip_preface_before_marker(cleaned)
-        # 额外去除清洗后可能残留的开头分隔线（---）
-        # 允许 BOM (\ufeff) 与 ZWSP (\u200b) 在分隔线两侧
-        cleaned = re.sub(r'(?m)\A(?:[\s\ufeff\u200b]*-{3,}[\s\ufeff\u200b]*\r?\n)+', '', cleaned)
-        return cleaned
+        """清洗模型输出（复用 utils.clean_model_output）"""
+        return clean_model_output(text)
 
     def _strip_preface_before_marker(self, text: str, max_preface_chars: int = 300) -> str:
-        """
-        如果在开头检测到短小客套语且后面紧跟 Markdown 分隔线（---），
-        仅在安全条件下移除前缀，避免误删正文。
-        """
-        # 更健壮地匹配分隔线，允许 Unicode 隐藏空白（如 BOM/ZWSP）在两侧
-        marker_match = re.search(r'(?m)^[\s\ufeff\u200b]*-{3,}[\s\ufeff\u200b]*$', text)
-        if not marker_match:
-            return text
-
-        if marker_match.start() > max_preface_chars:
-            return text
-
-        preface = text[:marker_match.start()].strip()
-        if not preface:
-            # 如果没有前缀（直接以 --- 开头），去掉分隔线并返回后续内容
-            return text[marker_match.end():].lstrip("\r\n")
-
-        # 仅移除很短且不包含结构性 Markdown 的前缀
-        if len(preface) > 400:
-            return text
-
-        if preface.count("\n") > 2:
-            return text
-
-        if re.search(r'#{1,6}\s|---|```', preface):
-            return text
-
-        return text[marker_match.end():].lstrip("\r\n")
+        """移除客套前缀（复用 utils.strip_preface_before_marker）"""
+        return strip_preface_before_marker(text, max_preface_chars)
 
     def _generate_note(self, contents):
         """
         生成笔记，采用两次调用+智能拼接策略确保完整输出。
         """
+        # 完整性检测标志：笔记模板中的最后一个关键章节
+        COMPLETION_MARKER = "5.4 学习建议"
+        
         # 第一次调用：生成主体内容
         logger.info("📝 开始第一次生成...")
         response1 = self.model.generate_content(
@@ -879,6 +1086,11 @@ class CoreProcessor:
         first_result = self._clean_model_output(response1.text)
         logger.info(f"✅ 第一次生成完成，字符数: {len(first_result)}")
         
+        # 检查第一次生成是否已完整（包含最终章节标志）
+        if COMPLETION_MARKER in first_result:
+            logger.info(f"✅ 第一次生成已包含 '{COMPLETION_MARKER}'，内容完整")
+            return first_result
+        
         # 检查是否需要续写（如果字符数较多且可能被截断）
         if len(first_result) < 5000:
             # 内容太短，直接返回并警告
@@ -886,12 +1098,12 @@ class CoreProcessor:
             return first_result
         
         # 第二次调用：续写未完成部分
-        logger.info("📝 检测到内容较长，启动第二次续写...")
+        logger.info(f"📝 未检测到 '{COMPLETION_MARKER}'，启动第二次续写...")
         time.sleep(2)  # 避免请求过快
         
         continuation_prompt = [
-            "之前的内容已生成，但可能未完成全部 5 个部分。",
-            "请继续补充完成剩余部分，直接从断点处继续输出，无需重复已有内容。",
+            "之前生成的内容只是部分，但尚未包含完整的 5 大部分。",
+            "请继续补充完成剩余部分（尤其是 5.4 学习建议 & 复习策略），直接从断点处继续输出，无需重复已有内容。",
             "如果已全部完成，请回复：「已全部生成完毕」"
         ]
         
@@ -908,12 +1120,16 @@ class CoreProcessor:
         
         # 检查是否真的有续写内容
         if "已全部生成完毕" in second_result or "已经完成" in second_result or len(second_result) < 100:
-            logger.info("✅ 第一次已生成完整，无需拼接")
+            logger.info("✅ 模型回复已完成，无需拼接")
             return first_result
         
         # 智能拼接：去除第二次输出中的重复部分
         merged_result = self._merge_continuations(first_result, second_result)
         logger.info(f"✅ 拼接完成，最终字符数: {len(merged_result)}")
+        
+        # 最终完整性检查
+        if COMPLETION_MARKER not in merged_result:
+            logger.warning(f"⚠️ 拼接后仍未包含 '{COMPLETION_MARKER}'，内容可能不完整")
         
         return merged_result
     
@@ -938,7 +1154,6 @@ class CoreProcessor:
             return first_part + "\n\n" + cleaned_second
         
         # 策略3：查找明确的章节标题（# 5.3 或 ## 5.3 或 ### 等）
-        import re
         section_match = re.search(r'\n#{1,3}\s+\d+\.\d+', second_part)
         if section_match:
             start_pos = section_match.start()
@@ -950,161 +1165,475 @@ class CoreProcessor:
         return first_part + "\n\n" + second_part
 
     def save_to_obsidian(self, course_name, lesson_title, target_url, note_content, formatted_name):
+        """保存笔记到 Obsidian，使用临时文件确保原子性写入。"""
         try:
             course_dir = Path(OBSIDIAN_VAULT_PATH) / self.sanitize_filename(course_name)
             course_dir.mkdir(parents=True, exist_ok=True)
             
             note_path = course_dir / f"{formatted_name}.md"
+            tmp_path = course_dir / f"{formatted_name}.md.tmp"
             
-            with open(note_path, 'w', encoding='utf-8') as f:
+            # 清理可能存在的残留临时文件
+            if tmp_path.exists():
+                tmp_path.unlink()
+                logger.debug(f"清理残留临时文件: {tmp_path}")
+            
+            # 写入临时文件
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 f.write(f"**日期**: {time.strftime('%Y-%m-%d')}\n")
                 f.write(f"**源视频**: {target_url}\n\n")
                 f.write("---\n\n")
                 f.write(note_content)
             
+            # 成功后重命名为正式文件
+            if note_path.exists():
+                note_path.unlink()
+            tmp_path.rename(note_path)
+            
             logger.info(f"笔记已保存至: {note_path}")
             return str(note_path)
         except Exception as e:
+            # 清理失败的临时文件
+            if tmp_path.exists():
+                tmp_path.unlink()
             logger.error(f"保存笔记失败: {e}")
             raise e
 
-    def run_full_workflow(self, url, course_name, lesson_title, progress_callback=None, cancel_callback=None):
+    # ================= 三个独立步骤方法（递进式调用）=================
+    
+    def step_download(self, url, course_name, lesson_title, 
+                      skip_existing=False, progress_callback=None, cancel_callback=None):
         """
-        Executes the full pipeline: Download -> Transcribe -> Gemini -> Obsidian
+        步骤1：下载音频
+        
+        Args:
+            url: 视频流 URL
+            course_name: 课程名称
+            lesson_title: 课节标题
+            skip_existing: 如果已存在，是否自动跳过（False 时会返回 exists 状态让调用方决定）
+            progress_callback: 进度回调 (status, pct, msg)
+            cancel_callback: 取消检测回调
+            
+        Returns:
+            dict: {
+                'success': bool,
+                'cancelled': bool,
+                'skipped': bool,         # 是否跳过（已存在且 skip_existing=True）
+                'exists': bool,          # 是否已存在（skip_existing=False 时返回此状态）
+                'audio_path': str,       # 音频路径
+                'formatted_name': str,
+            }
         """
-        audio_file_path = None
-        transcript_text = None
-        subtitle_temp_path = None
-        transcript_txt_temp_path = None
-        saved_subtitle_path = None
-        saved_transcript_txt_path = None
-
         def should_cancel():
             return callable(cancel_callback) and cancel_callback()
         
-        def cleanup_audio():
-            if audio_file_path and os.path.exists(audio_file_path):
-                try:
-                    os.remove(audio_file_path)
-                except OSError:
-                    pass
-
-        def abort():
-            cleanup_audio()
-            report("cancelled", 0, "任务已取消")
-            return {"success": False, "cancelled": True}
-
         def report(status, pct, msg):
             if progress_callback:
                 progress_callback(status, pct, msg)
             else:
                 logger.info(f"[{status}] {msg}")
-
-        if should_cancel():
-            return abort()
-
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        formatted_name = self.parse_metadata(course_name, lesson_title)
-        audio_file_path = os.path.join(TEMP_DIR, f"{formatted_name}.m4a")
         
         if should_cancel():
-            return abort()
-
-        # 1. Download
+            return {"success": False, "cancelled": True}
+        
+        # 检测已有文件
+        existing = self.check_existing_files(course_name, lesson_title)
+        formatted_name = existing['formatted_name']
+        
+        # 如果音频已存在
+        if existing['audio_complete'] and existing['audio_path']:
+            if skip_existing:
+                report("completed", 100, f"✅ 音频已存在，跳过: {existing['audio_path']}")
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "exists": True,
+                    "audio_path": existing['audio_path'],
+                    "formatted_name": formatted_name,
+                }
+            else:
+                # 返回 exists 状态，让调用方（前端）决定是否覆盖
+                return {
+                    "success": True,
+                    "skipped": False,
+                    "exists": True,
+                    "audio_path": existing['audio_path'],
+                    "formatted_name": formatted_name,
+                    "message": "音频已存在，请确认是否重新下载"
+                }
+        
+        # 执行下载
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        audio_path = os.path.join(DOWNLOAD_DIR, f"{formatted_name}.m4a")
+        
         report("downloading", 10, "开始下载音频...")
         if should_cancel():
-            return abort()
-        if not self.download_media(url, audio_file_path, audio_only=True):
+            return {"success": False, "cancelled": True}
+        
+        if not self.download_media(url, audio_path, audio_only=True):
             report("error", 0, "下载失败")
-            return {"success": False}
+            return {"success": False, "error": "下载失败"}
         
-        if should_cancel():
-            return abort()
-
-        # 2. Transcribe
-        report("processing", 35, "正在生成字幕...")
-        if should_cancel():
-            return abort()
-        try:
-            transcript_data = transcribe_audio(
-                audio_path=audio_file_path,
-                output_dir=TEMP_DIR,
-                language="auto",
-            )
-            subtitle_temp_path = transcript_data.get("srt_path")
-            transcript_txt_temp_path = transcript_data.get("txt_path")
-            transcript_text = transcript_data.get("text")
-            report("processing", 55, "字幕生成完成")
-        except Exception as e:
-            logger.error("字幕生成失败，将回退到音频处理: %s", e)
-            report("processing", 55, f"字幕生成失败，直接使用音频: {e}")
-            transcript_text = None
-
-        if should_cancel():
-            return abort()
-        
-        # 3. Gemini
-        report("processing", 70, "Gemini 3 Pro 处理中...")
-        if should_cancel():
-            return abort()
-        try:
-            note_content = self.process_with_gemini(audio_file_path, transcript_text=transcript_text)
-        except Exception as e:
-            report("error", 0, f"Gemini 生成失败: {e}")
-            return {"success": False}
-        
-        if should_cancel():
-            return abort()
-            
-        # 4. Obsidian
-        report("processing", 90, "正在保存到 Obsidian...")
-        if should_cancel():
-            return abort()
-        try:
-            note_path = self.save_to_obsidian(course_name, lesson_title, url, note_content, formatted_name)
-        except Exception:
-            report("error", 0, "保存失败")
-            return {"success": False}
-
-        # 5. 保存字幕到笔记目录
-        saved_paths = self._persist_transcripts(
-            course_name,
-            formatted_name,
-            subtitle_temp_path,
-            transcript_txt_temp_path
-        )
-        saved_subtitle_path = saved_paths.get("subtitle_path")
-        saved_transcript_txt_path = saved_paths.get("transcript_path")
-
-        # Cleanup
-        cleanup_audio()
-            
-        report("completed", 100, f"完成！笔记已创建: {note_path}")
+        report("completed", 100, f"下载完成: {audio_path}")
         return {
             "success": True,
-            "note_path": str(note_path),
-            "subtitle_path": saved_subtitle_path,
-            "transcript_path": saved_transcript_txt_path,
+            "skipped": False,
+            "exists": False,
+            "audio_path": audio_path,
+            "formatted_name": formatted_name,
         }
 
-    def _persist_transcripts(self, course_name, formatted_name, subtitle_temp_path, transcript_temp_path):
+    def step_transcribe(self, url, course_name, lesson_title,
+                        skip_existing=False, progress_callback=None, cancel_callback=None):
         """
-        Copy generated transcripts into the course folder alongside the note.
+        步骤2：转录音频（会先确保音频已下载）
+        
+        内部调用 step_download(skip_existing=True) 确保音频存在
+        
+        Args:
+            url: 视频流 URL（用于下载，如果需要）
+            course_name: 课程名称
+            lesson_title: 课节标题
+            skip_existing: 如果字幕已存在，是否自动跳过
+            progress_callback: 进度回调
+            cancel_callback: 取消检测回调
+            
+        Returns:
+            dict: {
+                'success': bool,
+                'cancelled': bool,
+                'skipped': bool,
+                'exists': bool,
+                'audio_path': str,
+                'subtitle_path': str,      # srt 路径
+                'transcript_path': str,    # txt 路径
+                'transcript_text': str,    # 转录文本
+                'formatted_name': str,
+            }
         """
-        saved = {}
+        def should_cancel():
+            return callable(cancel_callback) and cancel_callback()
+        
+        def report(status, pct, msg):
+            if progress_callback:
+                progress_callback(status, pct, msg)
+            else:
+                logger.info(f"[{status}] {msg}")
+        
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        # 1. 先确保音频已下载（自动跳过已存在的）
+        report("processing", 5, "检查音频文件...")
+        download_result = self.step_download(
+            url=url,
+            course_name=course_name,
+            lesson_title=lesson_title,
+            skip_existing=True,  # 转录时自动跳过已有音频
+            progress_callback=lambda s, p, m: report(s, int(p * 0.3), m),  # 下载占 0-30%
+            cancel_callback=cancel_callback
+        )
+        
+        if not download_result.get("success"):
+            return download_result
+        
+        audio_path = download_result['audio_path']
+        formatted_name = download_result['formatted_name']
+        
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        # 2. 检查字幕是否已存在
+        existing = self.check_existing_files(course_name, lesson_title)
+        
+        if existing['subtitle_path'] and existing['transcript_text']:
+            if skip_existing:
+                report("completed", 100, f"✅ 字幕已存在，跳过: {existing['subtitle_path']}")
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "exists": True,
+                    "audio_path": audio_path,
+                    "subtitle_path": existing['subtitle_path'],
+                    "transcript_path": existing['subtitle_path'],
+                    "transcript_text": existing['transcript_text'],
+                    "formatted_name": formatted_name,
+                }
+            else:
+                return {
+                    "success": True,
+                    "skipped": False,
+                    "exists": True,
+                    "audio_path": audio_path,
+                    "subtitle_path": existing['subtitle_path'],
+                    "transcript_text": existing['transcript_text'],
+                    "formatted_name": formatted_name,
+                    "message": "字幕已存在，请确认是否重新转录"
+                }
+        
+        # 3. 执行转录
+        report("processing", 35, "正在转录音频...")
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
         try:
-            course_dir = Path(OBSIDIAN_VAULT_PATH) / self.sanitize_filename(course_name)
-            course_dir.mkdir(parents=True, exist_ok=True)
-
-            if subtitle_temp_path and os.path.exists(subtitle_temp_path):
-                target = course_dir / f"{formatted_name}.srt"
-                shutil.copy2(subtitle_temp_path, target)
-                saved["subtitle_path"] = str(target)
-
-            if transcript_temp_path and os.path.exists(transcript_temp_path):
-                target_txt = course_dir / f"{formatted_name}.txt"
-                shutil.copy2(transcript_temp_path, target_txt)
-                saved["transcript_path"] = str(target_txt)
+            transcript_data = transcribe_audio(
+                audio_path=audio_path,
+                output_dir=DOWNLOAD_DIR,
+                language="auto",
+            )
+            subtitle_path = transcript_data.get("srt_path")
+            transcript_path = transcript_data.get("txt_path")
+            transcript_text = transcript_data.get("text")
+            
+            report("completed", 100, f"转录完成: {subtitle_path}")
+            return {
+                "success": True,
+                "skipped": False,
+                "exists": False,
+                "audio_path": audio_path,
+                "subtitle_path": subtitle_path,
+                "transcript_path": transcript_path,
+                "transcript_text": transcript_text,
+                "formatted_name": formatted_name,
+            }
         except Exception as e:
-            logger.warning("保存字幕文件时出错: %s", e)
-        return saved
+            logger.error(f"转录失败: {e}")
+            report("error", 0, f"转录失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    def step_transcribe_from_audio(self, audio_path, course_name, lesson_title,
+                                   skip_existing=False, progress_callback=None, cancel_callback=None):
+        """
+        步骤2b：直接从已有音频文件转录（不需要 URL）
+        
+        用于音频已存在的场景，跳过下载步骤。
+        
+        Args:
+            audio_path: 音频文件路径
+            course_name: 课程名称
+            lesson_title: 课节标题
+            skip_existing: 如果字幕已存在，是否自动跳过
+            progress_callback: 进度回调
+            cancel_callback: 取消检测回调
+            
+        Returns:
+            dict: 同 step_transcribe
+        """
+        def should_cancel():
+            return callable(cancel_callback) and cancel_callback()
+        
+        def report(status, pct, msg):
+            if progress_callback:
+                progress_callback(status, pct, msg)
+            else:
+                logger.info(f"[{status}] {msg}")
+        
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        # 验证音频文件存在
+        if not os.path.exists(audio_path):
+            report("error", 0, f"音频文件不存在: {audio_path}")
+            return {"success": False, "error": f"音频文件不存在: {audio_path}"}
+        
+        formatted_name = self.parse_metadata(course_name, lesson_title)
+        
+        # 检查字幕是否已存在
+        existing = self.check_existing_files(course_name, lesson_title)
+        
+        if existing['subtitle_path'] and existing['transcript_text']:
+            if skip_existing:
+                report("completed", 100, f"✅ 字幕已存在，跳过: {existing['subtitle_path']}")
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "exists": True,
+                    "audio_path": audio_path,
+                    "subtitle_path": existing['subtitle_path'],
+                    "transcript_path": existing['subtitle_path'],
+                    "transcript_text": existing['transcript_text'],
+                    "formatted_name": formatted_name,
+                }
+            else:
+                return {
+                    "success": True,
+                    "skipped": False,
+                    "exists": True,
+                    "audio_path": audio_path,
+                    "subtitle_path": existing['subtitle_path'],
+                    "transcript_text": existing['transcript_text'],
+                    "formatted_name": formatted_name,
+                    "message": "字幕已存在，请确认是否重新转录"
+                }
+        
+        # 执行转录
+        report("processing", 30, "正在转录音频...")
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        try:
+            transcript_data = transcribe_audio(
+                audio_path=audio_path,
+                output_dir=DOWNLOAD_DIR,
+                language="auto",
+            )
+            subtitle_path = transcript_data.get("srt_path")
+            transcript_path = transcript_data.get("txt_path")
+            transcript_text = transcript_data.get("text")
+            
+            report("completed", 100, f"转录完成: {subtitle_path}")
+            return {
+                "success": True,
+                "skipped": False,
+                "exists": False,
+                "audio_path": audio_path,
+                "subtitle_path": subtitle_path,
+                "transcript_path": transcript_path,
+                "transcript_text": transcript_text,
+                "formatted_name": formatted_name,
+            }
+        except Exception as e:
+            logger.error(f"转录失败: {e}")
+            report("error", 0, f"转录失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    def step_generate_note(self, url, course_name, lesson_title,
+                           skip_existing=False, progress_callback=None, cancel_callback=None):
+        """
+        步骤3：生成笔记（会先确保字幕已生成）
+        
+        内部调用 step_transcribe(skip_existing=True) 确保字幕存在
+        
+        Args:
+            url: 视频流 URL（用于下载，如果需要）
+            course_name: 课程名称
+            lesson_title: 课节标题
+            skip_existing: 如果笔记已存在，是否自动跳过
+            progress_callback: 进度回调
+            cancel_callback: 取消检测回调
+            
+        Returns:
+            dict: {
+                'success': bool,
+                'cancelled': bool,
+                'skipped': bool,
+                'exists': bool,
+                'audio_path': str,
+                'subtitle_path': str,
+                'note_path': str,
+                'formatted_name': str,
+            }
+        """
+        def should_cancel():
+            return callable(cancel_callback) and cancel_callback()
+        
+        def report(status, pct, msg):
+            if progress_callback:
+                progress_callback(status, pct, msg)
+            else:
+                logger.info(f"[{status}] {msg}")
+        
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        # 0. 先检查笔记是否已存在
+        existing = self.check_existing_files(course_name, lesson_title)
+        formatted_name = existing['formatted_name']
+        
+        if existing['note_exists'] and existing['note_path']:
+            if skip_existing:
+                report("completed", 100, f"✅ 笔记已存在，跳过: {existing['note_path']}")
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "exists": True,
+                    "note_path": existing['note_path'],
+                    "subtitle_path": existing.get('subtitle_path'),
+                    "formatted_name": formatted_name,
+                }
+            else:
+                # skip_existing=False 时，继续执行以强制重新生成
+                report("processing", 5, "🔄 笔记已存在，准备重新生成...")
+        
+        # 1. 先确保字幕已生成（自动跳过已存在的）
+        report("processing", 10, "检查字幕文件...")
+        transcribe_result = self.step_transcribe(
+            url=url,
+            course_name=course_name,
+            lesson_title=lesson_title,
+            skip_existing=True,  # 生成笔记时自动跳过已有字幕
+            progress_callback=lambda s, p, m: report(s, int(10 + p * 0.45), m),  # 转录占 10-55%
+            cancel_callback=cancel_callback
+        )
+        
+        if not transcribe_result.get("success"):
+            return transcribe_result
+        
+        audio_path = transcribe_result.get('audio_path')
+        subtitle_path = transcribe_result.get('subtitle_path')
+        transcript_text = transcribe_result.get('transcript_text')
+        
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        # 2. 调用 Gemini 生成笔记
+        report("processing", 60, "Gemini 生成笔记中...")
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        try:
+            note_content = self.process_with_gemini(audio_path, transcript_text=transcript_text)
+        except Exception as e:
+            logger.error(f"Gemini 生成失败: {e}")
+            report("error", 0, f"Gemini 生成失败: {e}")
+            return {"success": False, "error": str(e)}
+        
+        if should_cancel():
+            return {"success": False, "cancelled": True}
+        
+        # 3. 保存到 Obsidian
+        report("processing", 90, "保存笔记...")
+        try:
+            note_path = self.save_to_obsidian(course_name, lesson_title, url, note_content, formatted_name)
+        except Exception as e:
+            logger.error(f"保存失败: {e}")
+            report("error", 0, f"保存失败: {e}")
+            return {"success": False, "error": str(e)}
+        
+        # 字幕文件已经保存在 DOWNLOAD_DIR，无需额外复制
+        
+        report("completed", 100, f"笔记生成完成: {note_path}")
+        return {
+            "success": True,
+            "skipped": False,
+            "exists": False,
+            "audio_path": audio_path,
+            "subtitle_path": subtitle_path,
+            "note_path": note_path,
+            "formatted_name": formatted_name,
+        }
+
+    def run_full_workflow(self, url, course_name, lesson_title, progress_callback=None, cancel_callback=None, force_regenerate=False):
+        """
+        执行完整流程: 下载 -> 转录 -> Gemini -> Obsidian
+        
+        这是一个便捷方法，内部调用 step_generate_note 实现递进式流程。
+        
+        Args:
+            url: 视频流 URL
+            course_name: 课程名称
+            lesson_title: 课节标题
+            progress_callback: 进度回调函数 (status, pct, msg)
+            cancel_callback: 取消检测回调
+            force_regenerate: 是否强制重新生成笔记（即使已存在）
+        """
+        # 直接委托给 step_generate_note，它会自动处理下载和转录
+        return self.step_generate_note(
+            url=url,
+            course_name=course_name,
+            lesson_title=lesson_title,
+            skip_existing=not force_regenerate,  # force_regenerate=True 时不跳过
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback
+        )

@@ -1116,7 +1116,7 @@
         }
 
         const targetUrl = urlList.find((u) => u.includes(".mp4")) || urlList[0];
-        const taskId = await submitTask(
+        await submitTask(
             "/download",
             {
                 url: targetUrl,
@@ -1126,13 +1126,8 @@
             "下载音频",
             metadata.lessonTitle
         );
-
-        if (taskId) {
-            // 监听下载完成，自动触发转录
-            waitForTaskCompletion(taskId, () => {
-                handleTranscribeOnly(metadata, null);
-            });
-        }
+        
+        // 已移除自动转录：用户需要手动点击"转录音频"按钮
     }
 
     async function handleDownloadVideo(metadata, urlList, fileCheck) {
@@ -1163,26 +1158,21 @@
         );
     }
 
-    async function handleTranscribeOnly(metadata, audioPath) {
-        const taskId = await submitTask(
-            "/transcribe-only",
-            {
-                courseName: metadata.courseName,
-                lessonTitle: metadata.lessonTitle,
-                audioPath: audioPath,
-            },
-            "转录音频",
-            metadata.lessonTitle
-        );
-
-        return taskId;
-    }
-
+    // 已移除 handleTranscribeOnly 和 waitForTaskCompletion 函数
+    // 现在所有按钮都直接调用对应的递进式接口
     async function handleGenerateNote(metadata, urlList, fileCheck) {
+        if (urlList.length === 0) {
+            alert("未检测到视频链接，请先播放视频后重试。");
+            return;
+        }
+
         // 智能判断：需要下载 -> 转录 -> 生成笔记
         let needDownload = !fileCheck.audioExists || !fileCheck.audioComplete;
         // Gemini 需要 TXT 格式，不能只有 SRT
         let needTranscribe = !fileCheck.txtExists;
+        
+        // 标记是否需要强制重新生成（笔记已存在且用户确认重新生成）
+        let forceRegenerate = false;
 
         if (fileCheck.noteExists) {
             const action = confirm(
@@ -1191,6 +1181,7 @@
                     `是否重新生成？`
             );
             if (!action) return;
+            forceRegenerate = true;  // 用户确认要重新生成
         }
 
         let message = `确认生成 AI 笔记吗？\n\n课程: ${metadata.courseName}\n标题: ${metadata.lessonTitle}\n\n`;
@@ -1205,70 +1196,30 @@
                 message += "⚠️ 需要先转录音频\n";
             }
         }
+        if (forceRegenerate) {
+            message += "🔄 将重新生成笔记（覆盖已有文件）\n";
+        }
         message += "\n将自动执行所有必需步骤";
 
         if (!confirm(message)) {
             return;
         }
 
-        if (needDownload) {
-            // 下载音频
-            const targetUrl =
-                urlList.find((u) => u.includes(".mp4")) || urlList[0];
-            const downloadTaskId = await submitTask(
-                "/download",
-                {
-                    url: targetUrl,
-                    filename: metadata.lessonTitle,
-                    type: "audio",
-                },
-                "下载音频 (步骤1/3)",
-                metadata.lessonTitle
-            );
-
-            // 等待下载完成，然后转录
-            waitForTaskCompletion(downloadTaskId, async () => {
-                const transcribeTaskId = await handleTranscribeOnly(
-                    metadata,
-                    null
-                );
-                // 等待转录完成，然后生成笔记
-                waitForTaskCompletion(transcribeTaskId, () => {
-                    submitGenerateNoteOnly(metadata, urlList);
-                });
-            });
-        } else if (needTranscribe) {
-            // 只需转录
-            const transcribeTaskId = await handleTranscribeOnly(
-                metadata,
-                fileCheck.paths.audio
-            );
-            waitForTaskCompletion(transcribeTaskId, () => {
-                submitGenerateNoteOnly(metadata, urlList);
-            });
-        } else {
-            // 直接生成笔记
-            await submitGenerateNoteOnly(metadata, urlList);
-        }
-    }
-
-    async function submitGenerateNoteOnly(metadata, urlList) {
-        const targetUrl =
-            urlList.length > 0
-                ? urlList.find((u) => u.includes(".mp4")) || urlList[0]
-                : "";
-
+        // 使用服务器的递进式流程（一个任务自动完成所有步骤）
         await submitTask(
-            "/generate-note-only",
+            "/process",
             {
+                urls: urlList,
                 courseName: metadata.courseName,
                 lessonTitle: metadata.lessonTitle,
-                videoUrl: targetUrl,
+                forceRegenerate: forceRegenerate,  // 传递强制重新生成标志
             },
             "生成 AI 笔记",
             metadata.lessonTitle
         );
     }
+
+    // 已移除 submitGenerateNoteOnly 函数，现在直接使用 /process 接口
 
     async function handleTranscribeAction() {
         const metadata = getMetadata();
@@ -1278,46 +1229,6 @@
                 metadata.courseName,
                 metadata.lessonTitle
             );
-
-            if (!fileCheck.audioExists || !fileCheck.audioComplete) {
-                // 音频不存在，询问是否下载
-                const shouldDownload = confirm(
-                    "❌ 音频文件不存在或不完整！\n\n" +
-                        "是否先下载音频？\n" +
-                        '- 点击"确定"下载并转录\n' +
-                        '- 点击"取消"返回'
-                );
-
-                if (!shouldDownload) return;
-
-                // 下载音频
-                scanVideoTags();
-                if (detectedUrls.size === 0) {
-                    alert("未检测到视频链接！请尝试播放视频后再点击。");
-                    return;
-                }
-
-                const urlList = Array.from(detectedUrls);
-                const targetUrl =
-                    urlList.find((u) => u.includes(".mp4")) || urlList[0];
-
-                const downloadTaskId = await submitTask(
-                    "/download",
-                    {
-                        url: targetUrl,
-                        filename: metadata.lessonTitle,
-                        type: "audio",
-                    },
-                    "下载音频 (步骤1/2)",
-                    metadata.lessonTitle
-                );
-
-                // 等待下载完成，自动转录
-                waitForTaskCompletion(downloadTaskId, () => {
-                    handleTranscribeOnly(metadata, null);
-                });
-                return;
-            }
 
             if (fileCheck.subtitleExists) {
                 const action = confirm(
@@ -1329,47 +1240,26 @@
                 if (!action) return;
             }
 
-            await handleTranscribeOnly(metadata, fileCheck.paths.audio);
+            // 使用递进式转录接口（会自动下载音频如果不存在）
+            scanVideoTags();
+            const urlList = Array.from(detectedUrls);
+            
+            await submitTask(
+                "/transcribe",
+                {
+                    urls: urlList,
+                    courseName: metadata.courseName,
+                    lessonTitle: metadata.lessonTitle,
+                },
+                "转录音频",
+                metadata.lessonTitle
+            );
         } catch (error) {
             console.error("[AI助手] 转录操作失败:", error);
         }
     }
 
-    function waitForTaskCompletion(taskId, callback) {
-        if (!taskId) return;
-
-        const checkInterval = setInterval(() => {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: `${SERVER_URL}/tasks/${taskId}`,
-                onload: function (response) {
-                    if (response.status === 200) {
-                        const data = JSON.parse(response.responseText);
-                        if (data.status === "completed") {
-                            clearInterval(checkInterval);
-                            setTimeout(() => {
-                                console.log(
-                                    `[AI助手] 任务 ${taskId} 完成，触发下一步`
-                                );
-                                callback();
-                            }, 1000);
-                        } else if (
-                            data.status === "error" ||
-                            data.status === "cancelled"
-                        ) {
-                            clearInterval(checkInterval);
-                            console.error(
-                                `[AI助手] 任务 ${taskId} 失败或被取消`
-                            );
-                        }
-                    }
-                },
-                onerror: function () {
-                    clearInterval(checkInterval);
-                },
-            });
-        }, 2000);
-    }
+    // 已移除 waitForTaskCompletion 函数（不再需要手动串联任务）
 
     // ============================================================
     // 5. 原有功能保持
