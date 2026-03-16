@@ -1,3 +1,6 @@
+# Google Gemini SDK 示例。
+# 当前项目主流程默认走 AI_PROVIDER=openai 的 OpenAI 兼容接口；
+# 只有在 AI_PROVIDER=google 时才会用到 Google 路径。
 # To run this code you need to install the following dependencies:
 # pip install google-genai
 

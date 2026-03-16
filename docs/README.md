@@ -9,4 +9,6 @@
 - `CONFLICT_RESOLUTION.md`: 浏览器面板归属与冲突处理
 - `PERFORMANCE_OPTIMIZATION.md`: 主要性能参数与调优建议
 
+当前默认配置以 `AI_PROVIDER=openai` 为主；如果文档中提到 Gemini，请按“Google 兼容路径”理解。
+
 其余文档更偏向开发过程记录或提示词调优笔记。

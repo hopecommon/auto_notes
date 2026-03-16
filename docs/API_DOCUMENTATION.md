@@ -2,6 +2,19 @@
 
 本地服务默认运行在 `http://localhost:5000`。
 
+## AI 提供方
+
+当前服务支持两种笔记生成后端：
+
+- `AI_PROVIDER=openai`：默认模式，走 OpenAI 兼容 `chat/completions`
+- `AI_PROVIDER=google`：兼容模式，走 `google.generativeai`
+
+说明：
+
+- 默认建议使用 `openai`
+- 当前 `openai` 模式主要走“字幕文本生成笔记”
+- 完整流程 `/process` 仍然可用，因为它会先完成转录，再基于字幕生成
+
 ## 设计原则
 
 - 浏览器前端只负责提交任务和展示状态
@@ -109,6 +122,8 @@
   "forceRegenerate": false
 }
 ```
+
+在默认 `openai` 模式下，这条流程会自动先补齐字幕，再调用 OpenAI 兼容接口生成笔记。
 
 ## `POST /generate-note-only`
 

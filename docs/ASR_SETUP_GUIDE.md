@@ -80,5 +80,33 @@ FASTWHISPER_COMPUTE=int8
 确保：
 
 - `FASTWHISPER_LOCAL_DIR` 指向已经存在的模型目录
-- `GOOGLE_API_KEY` 只在生成笔记时需要
-- 仅下载和转录流程可以脱离 Gemini 运行
+- 仅下载和转录流程可以脱离 AI 笔记生成运行
+
+## AI 笔记生成补充
+
+当前默认配置是：
+
+```bash
+AI_PROVIDER=openai
+```
+
+常见最小配置：
+
+```bash
+AI_PROVIDER=openai
+OPENAI_API_KEY=your_api_key_here
+OPENAI_MODEL=gemini-3.1-pro-preview-thinking
+```
+
+如需接入自定义 OpenAI 兼容服务，再补充：
+
+```bash
+OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
+```
+
+如果你确实要切回 Google：
+
+```bash
+AI_PROVIDER=google
+GOOGLE_API_KEY=your_api_key_here
+```

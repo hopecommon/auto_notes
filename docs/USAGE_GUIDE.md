@@ -27,6 +27,21 @@ cp env.example .env
 最少需要配置：
 
 ```bash
+AI_PROVIDER=openai
+OPENAI_API_KEY=your_api_key_here
+OPENAI_MODEL=gemini-3.1-pro-preview-thinking
+```
+
+如果你的 OpenAI 兼容服务需要自定义地址，再额外配置：
+
+```bash
+OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
+```
+
+如果你想改回 Google Gemini，再使用：
+
+```bash
+AI_PROVIDER=google
 GOOGLE_API_KEY=your_api_key_here
 ```
 
@@ -71,6 +86,8 @@ uv run python auto_study_server.py
 - 缺音频时先下载
 - 缺字幕时再转录
 - 最后生成 Markdown 笔记
+
+当前默认的 `openai` 模式走的是“字幕文本生成笔记”路径，因此实际笔记生成前会先确保转录完成。
 
 ### 仅下载音频
 
@@ -123,6 +140,12 @@ uv run python auto_study_server.py
 
 - 确认 `uv run python auto_study_server.py` 正在运行
 - 确认本地 `5000` 端口没有被其他服务占用
+
+### 生成笔记时报 AI 提供方错误
+
+- 如果你使用默认模式，先检查 `AI_PROVIDER=openai`
+- 确认 `OPENAI_API_KEY` 不是空值或占位值
+- 看服务启动日志，确认当前到底走的是 `openai` 还是 `google`
 
 ### 任务恢复失败
 

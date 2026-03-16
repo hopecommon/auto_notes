@@ -13,7 +13,7 @@
 - 检测 SJTU 课程播放页中的视频流
 - 下载音频或视频
 - 使用 `faster-whisper` 生成 `srt` 和 `txt`
-- 使用 Gemini 基于字幕生成 Markdown 笔记
+- 使用 OpenAI 兼容接口或 Google Gemini 基于字幕生成 Markdown 笔记
 - 在浏览器面板中查看、取消、恢复任务
 
 ## 架构
@@ -37,8 +37,21 @@ uv sync
 cp env.example .env
 ```
 
-至少需要配置：
+至少需要配置一组 AI 提供方参数。
 
+默认推荐：
+
+- `AI_PROVIDER=openai`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+
+常见可选项：
+
+- `OPENAI_BASE_URL`
+
+可选回退：
+
+- `AI_PROVIDER=google`
 - `GOOGLE_API_KEY`
 
 可选配置：
@@ -62,6 +75,11 @@ uv run python auto_study_server.py
 ```
 
 服务默认监听 `http://localhost:5000`。
+
+启动时你应该能在日志里看到当前提供方，例如：
+
+- `已启用 OpenAI 兼容模式: ...`
+- 或 `已启用 Google Gemini 模式: ...`
 
 ### 4. 安装 userscript
 
@@ -90,3 +108,5 @@ node --check sjtu_video_helper.js
 - 本项目不是 SJTU 官方产品，也不与 Canvas 或校内视频平台存在官方关系。
 - 请自行确认使用行为符合课程平台、学校和地区的相关政策。
 - 不要提交 `.env`、本地模型目录或个人下载内容。
+- 当前默认文档口径以 `AI_PROVIDER=openai` 为主，Google Gemini 作为兼容选项保留。
+- `OPENAI_BASE_URL` 不是固定供应商配置，可按你使用的 OpenAI 兼容服务自行填写。
