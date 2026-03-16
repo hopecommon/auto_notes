@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,10 +19,23 @@ logging.basicConfig(
 if __name__ == "__main__":
     logger = logging.getLogger("TestTranscribe")
     try:
+        sample_audio = Path(
+            os.environ.get("SAMPLE_AUDIO_PATH", "data/samples/sample.m4a")
+        )
+        output_dir = Path(
+            os.environ.get("TRANSCRIBE_OUTPUT_DIR", "data/downloads")
+        )
+
+        if not sample_audio.exists():
+            raise FileNotFoundError(
+                "缺少示例音频。请设置 SAMPLE_AUDIO_PATH，或将测试音频放到 "
+                f"{sample_audio}。"
+            )
+
         logger.info("开始测试转录（会打印详细日志和异常堆栈）")
         result = transcribe_audio(
-            audio_path=r"D:\Download\SJTU_Courses\程序语言与编译原理-1017-0855.m4a",
-            output_dir=r"D:\Download\SJTU_Courses",
+            audio_path=str(sample_audio),
+            output_dir=str(output_dir),
             language="auto",
         )
         logger.info("测试转录成功！结果: %s", result)
@@ -33,4 +47,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         raise
-

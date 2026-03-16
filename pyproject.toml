@@ -1,8 +1,8 @@
 [project]
 name = "auto-notes"
 version = "0.1.0"
-description = "SJTU Canvas 课程自动笔记助手：下载→转录→AI笔记生成"
-readme = "docs/README.md"
+description = "SJTU Canvas 课程自动笔记助手：下载、转录与 AI 笔记生成"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "flask",

@@ -631,7 +631,7 @@
             if (video_id && video_id.length > 10) { // 10是我瞎写的
                 let new_search = "?canvasCourseId=" + encodeURIComponent(canvasCourseId) + "&id=" + video_id; // 适配20211201防串课更新
 
-                let new_url = new URL(location); // 这里原来不能用location啊，呜呜呜之前写的一直是错的
+                let new_url = new URL(location); // 这里需要显式构造 URL 对象，不能直接复用 location
                 new_url.search = new_search;
 
                 if (location.href != new_url && location.search != new_search) { // 点播页面检查的是当前url
@@ -644,7 +644,7 @@
                 }
             }
 
-            // 移除自带的反馈和帮助按钮，我的优秀用户已经不需要看那个入门资料了
+            // 移除自带的反馈和帮助按钮，减少页面噪音
             $(".lti-page-tab>.tab-help").remove()
 
 
@@ -1770,7 +1770,7 @@
                 })
 
                 // 倍速列表选项优化
-                // 移除了部分愚蠢的倍速数值
+                // 移除部分不常用的倍速选项
                 // 根据建议，补充了一个快得离谱的倍速
                 let speed_choice = [0.8, 0.9, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 6, 12]; // 16是该播放器支持的最高倍速
                 // let speed_choice = [0.5, 1.0, 1.25, 1.5, 2.0, 4.0, 8.0]; // 20221212新的列表

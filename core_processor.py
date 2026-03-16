@@ -25,10 +25,14 @@ import google.generativeai as genai
 from transcriber import transcribe_audio
 
 # ================= 配置区域 =================
-OBSIDIAN_VAULT_PATH = get_config("OBSIDIAN_VAULT_PATH", r"D:\OneDrive\Obsidian")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
+OBSIDIAN_VAULT_PATH = get_config(
+    "OBSIDIAN_VAULT_PATH", str(DEFAULT_DATA_ROOT / "notes")
+)
 GOOGLE_API_KEY = get_config("GOOGLE_API_KEY", "")
-TEMP_DIR = get_config("TEMP_DIR", "temp_downloads")
-DOWNLOAD_DIR = get_config("DOWNLOAD_DIR", r"D:\Download\SJTU_Courses")
+TEMP_DIR = get_config("TEMP_DIR", str(DEFAULT_DATA_ROOT / "temp"))
+DOWNLOAD_DIR = get_config("DOWNLOAD_DIR", str(DEFAULT_DATA_ROOT / "downloads"))
 
 HEADERS = DEFAULT_HEADERS
 
