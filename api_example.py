@@ -1,7 +1,6 @@
 # To run this code you need to install the following dependencies:
 # pip install google-genai
 
-import base64
 import os
 from google import genai
 from google.genai import types
@@ -12,7 +11,7 @@ def generate():
         api_key=os.environ.get("GEMINI_API_KEY"),
     )
 
-    model = "gemini-3-pro-preview"
+    model = "gemini-2.5-pro"
     contents = [
         types.Content(
             role="user",
@@ -23,13 +22,9 @@ def generate():
     ]
     tools = [
         types.Tool(url_context=types.UrlContext()),
-        types.Tool(googleSearch=types.GoogleSearch(
-        )),
+        types.Tool(google_search=types.GoogleSearch()),
     ]
     generate_content_config = types.GenerateContentConfig(
-        thinkingConfig: {
-            thinkingLevel: "HIGH",
-        },
         tools=tools,
     )
 

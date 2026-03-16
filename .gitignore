@@ -1,3 +1,13 @@
-.cache/*
-__pycache__/*
+# Python
+__pycache__/
+*.pyc
+
+# Environment
 .env
+.venv/
+
+# uv
+.uv-cache/
+
+# Cache
+.cache/

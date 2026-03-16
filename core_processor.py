@@ -994,6 +994,8 @@ class CoreProcessor:
                 'formatted_name': str,
                 'audio_path': str or None,       # 音频文件路径（如存在且完整）
                 'audio_complete': bool,          # 音频是否下载完整（>1MB）
+                'video_path': str or None,       # 视频文件路径（如存在且完整）
+                'video_complete': bool,          # 视频是否下载完整（>1MB）
                 'subtitle_path': str or None,    # 字幕文件路径（优先 txt）
                 'transcript_text': str or None,  # 字幕文本内容
                 'note_path': str or None,        # 笔记路径（如存在）
@@ -1007,6 +1009,8 @@ class CoreProcessor:
             'formatted_name': formatted_name,
             'audio_path': None,
             'audio_complete': False,
+            'video_path': None,
+            'video_complete': False,
             'subtitle_path': None,
             'transcript_text': None,
             'note_path': None,
@@ -1022,6 +1026,18 @@ class CoreProcessor:
                     if audio_size > 1024 * 1024:  # > 1MB 认为完整
                         result['audio_path'] = str(audio_path)
                         result['audio_complete'] = True
+                        break
+                except OSError:
+                    pass
+
+        for base_dir in [TEMP_DIR, DOWNLOAD_DIR]:
+            video_path = Path(base_dir) / f"{formatted_name}.mp4"
+            if video_path.exists():
+                try:
+                    video_size = video_path.stat().st_size
+                    if video_size > 1024 * 1024:
+                        result['video_path'] = str(video_path)
+                        result['video_complete'] = True
                         break
                 except OSError:
                     pass
@@ -1382,8 +1398,9 @@ class CoreProcessor:
 
     # ================= 三个独立步骤方法（递进式调用）=================
     
-    def step_download(self, url, course_name, lesson_title, 
-                      skip_existing=False, progress_callback=None, cancel_callback=None):
+    def step_download(self, url, course_name, lesson_title,
+                      skip_existing=False, media_type="audio",
+                      progress_callback=None, cancel_callback=None):
         """
         步骤1：下载音频
         
@@ -1402,6 +1419,7 @@ class CoreProcessor:
                 'skipped': bool,         # 是否跳过（已存在且 skip_existing=True）
                 'exists': bool,          # 是否已存在（skip_existing=False 时返回此状态）
                 'audio_path': str,       # 音频路径
+                'video_path': str,       # 视频路径
                 'formatted_name': str,
             }
         """
@@ -1417,52 +1435,57 @@ class CoreProcessor:
         if should_cancel():
             return {"success": False, "cancelled": True}
         
+        media_type = (media_type or "audio").lower()
+        if media_type not in {"audio", "video"}:
+            raise ValueError(f"不支持的下载类型: {media_type}")
+
         # 检测已有文件
         existing = self.check_existing_files(course_name, lesson_title)
         formatted_name = existing['formatted_name']
-        
-        # 如果音频已存在
-        if existing['audio_complete'] and existing['audio_path']:
+
+        existing_path_key = 'video_path' if media_type == 'video' else 'audio_path'
+        existing_complete_key = 'video_complete' if media_type == 'video' else 'audio_complete'
+        existing_path = existing.get(existing_path_key)
+
+        if existing.get(existing_complete_key) and existing_path:
             if skip_existing:
-                report("completed", 100, f"✅ 音频已存在，跳过: {existing['audio_path']}")
+                media_label = "视频" if media_type == "video" else "音频"
+                report("completed", 100, f"✅ {media_label}已存在，跳过: {existing_path}")
                 return {
                     "success": True,
                     "skipped": True,
                     "exists": True,
-                    "audio_path": existing['audio_path'],
+                    "audio_path": existing.get('audio_path'),
+                    "video_path": existing.get('video_path'),
+                    "media_type": media_type,
                     "formatted_name": formatted_name,
-                }
-            else:
-                # 返回 exists 状态，让调用方（前端）决定是否覆盖
-                return {
-                    "success": True,
-                    "skipped": False,
-                    "exists": True,
-                    "audio_path": existing['audio_path'],
-                    "formatted_name": formatted_name,
-                    "message": "音频已存在，请确认是否重新下载"
                 }
         
         # 执行下载
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        audio_path = os.path.join(DOWNLOAD_DIR, f"{formatted_name}.m4a")
+        output_ext = ".mp4" if media_type == "video" else ".m4a"
+        output_path = os.path.join(DOWNLOAD_DIR, f"{formatted_name}{output_ext}")
+        audio_only = media_type != "video"
         
-        report("downloading", 10, "开始下载音频...")
+        report("downloading", 10, "开始下载视频..." if media_type == "video" else "开始下载音频...")
         if should_cancel():
             return {"success": False, "cancelled": True}
         
-        if not self.download_media(url, audio_path, audio_only=True):
+        if not self.download_media(url, output_path, audio_only=audio_only):
             report("error", 0, "下载失败")
             return {"success": False, "error": "下载失败"}
         
-        report("completed", 100, f"下载完成: {audio_path}")
-        return {
+        report("completed", 100, f"下载完成: {output_path}")
+        result = {
             "success": True,
             "skipped": False,
             "exists": False,
-            "audio_path": audio_path,
+            "audio_path": output_path if media_type == "audio" else existing.get('audio_path'),
+            "video_path": output_path if media_type == "video" else existing.get('video_path'),
+            "media_type": media_type,
             "formatted_name": formatted_name,
         }
+        return result
 
     def step_transcribe(self, url, course_name, lesson_title,
                         skip_existing=False, progress_callback=None, cancel_callback=None):

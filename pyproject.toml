@@ -1,0 +1,17 @@
+[project]
+name = "auto-notes"
+version = "0.1.0"
+description = "SJTU Canvas 课程自动笔记助手：下载→转录→AI笔记生成"
+readme = "docs/README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flask",
+    "flask-cors",
+    "requests",
+    "google-generativeai",
+    "google-genai",
+    "ffmpeg-python",
+    "playwright",
+    "faster-whisper",
+    "python-dotenv",
+]

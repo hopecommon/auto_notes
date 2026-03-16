@@ -3,6 +3,7 @@ import time
 import logging
 import uuid
 import subprocess
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from threading import Thread, Lock
@@ -23,7 +24,99 @@ task_queue = Queue()
 task_status = {}  # {task_id: {status, progress, message, result, cancelled}}
 task_lock = Lock()
 cancelled_tasks = set()  # 存储已取消的任务ID
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
+SERIAL_TASK_EXECUTION = os.getenv("SERIAL_TASK_EXECUTION", "1") not in {"0", "false", "False"}
+WORKER_COUNT = 1 if SERIAL_TASK_EXECUTION else int(os.getenv("WORKER_COUNT", "4"))
+resource_locks = {}
+resource_lock_guard = Lock()
+
+ACTIVE_TASK_STATUSES = {"queued", "processing", "downloading"}
+TERMINAL_TASK_STATUSES = {"completed", "error", "cancelled"}
+
+
+def normalize_task_part(value):
+    value = (value or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", value)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "unknown"
+
+
+def build_task_resource_key(task_type, course_name="", lesson_title="", file_type=""):
+    """构建资源锁 key：同一课节的不同任务共用一把锁，避免并发写相同输出文件。"""
+    course_key = normalize_task_part(course_name)
+    lesson_key = normalize_task_part(lesson_title)
+    return f"{course_key}::{lesson_key}"
+
+
+def build_task_identity_key(task_type, course_name="", lesson_title="", file_type=""):
+    """构建任务去重 key：同一课节、同一种任务只保留一个活动任务。"""
+    resource_key = build_task_resource_key(task_type, course_name, lesson_title, file_type)
+    type_key = normalize_task_part(task_type)
+    file_type_key = normalize_task_part(file_type) if file_type else ""
+    identity_parts = [type_key]
+    if file_type_key and file_type_key != "unknown":
+        identity_parts.append(file_type_key)
+    identity_parts.append(resource_key)
+    return "::".join(identity_parts)
+
+
+def _find_reusable_task_locked(task_identity):
+    for task_id, info in task_status.items():
+        if (
+            info.get("taskIdentity") == task_identity
+            and info.get("status") in ACTIVE_TASK_STATUSES
+        ):
+            return task_id
+    return None
+
+
+def enqueue_managed_task(
+    task_type,
+    action_label,
+    display_title,
+    task_payload,
+    extra=None,
+    resource_key=None,
+    task_identity=None,
+):
+    """创建或复用任务，避免同一课节同类任务重复入队。"""
+    with task_lock:
+        if task_identity:
+            existing_task_id = _find_reusable_task_locked(task_identity)
+            if existing_task_id:
+                return existing_task_id, True
+        task_id = str(uuid.uuid4())
+        task_status[task_id] = {
+            "status": "queued",
+            "progress": 0,
+            "message": "任务已加入队列",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "taskType": task_type,
+            "actionLabel": action_label,
+            "displayTitle": display_title,
+            **(extra or {}),
+            "resourceKey": resource_key,
+            "taskIdentity": task_identity,
+        }
+
+    task_payload = {
+        **task_payload,
+        "id": task_id,
+        "type": task_type,
+        "resourceKey": resource_key,
+        "taskIdentity": task_identity,
+    }
+    task_queue.put(task_payload)
+    return task_id, False
+
+
+def get_resource_lock(resource_key):
+    if not resource_key:
+        return None
+    with resource_lock_guard:
+        if resource_key not in resource_locks:
+            resource_locks[resource_key] = Lock()
+        return resource_locks[resource_key]
 
 
 def init_task_record(task_id, task_type, action_label, display_title, extra=None):
@@ -62,6 +155,191 @@ def is_task_cancelled(task_id):
     with task_lock:
         return task_id in cancelled_tasks
 
+
+def process_task(task, processor):
+    task_id = task['id']
+    task_type = task['type']
+
+    def should_cancel():
+        return is_task_cancelled(task_id)
+
+    # 检查任务是否已被取消
+    if should_cancel():
+        logger.info(f"[Task {task_id}] 已被取消，跳过执行")
+        update_task(task_id, "cancelled", 0, "任务已取消")
+        return
+
+    # 定义通用回调函数（智能更新 actionLabel）
+    def progress_callback(status, pct, msg):
+        update_task(task_id, status, pct, msg)
+        with task_lock:
+            if task_id in task_status:
+                if task_type == "download":
+                    file_type = task.get("fileType", "audio").lower()
+                    label = "下载视频" if file_type == "video" else "下载音频"
+                    task_status[task_id]["actionLabel"] = f"{label} (步骤1/1)"
+                elif "下载" in msg or "downloading" in status.lower():
+                    task_status[task_id]["actionLabel"] = "下载音频 (步骤1/3)"
+                elif "转录" in msg or "transcribe" in msg.lower():
+                    task_status[task_id]["actionLabel"] = "转录音频 (步骤2/3)"
+                elif "Gemini" in msg or "生成笔记" in msg or "生成中" in msg:
+                    task_status[task_id]["actionLabel"] = "生成 AI 笔记 (步骤3/3)"
+
+    if task_type == 'note':
+        urls = task['urls']
+        course_name = task['courseName']
+        lesson_title = task['lessonTitle']
+        overwrite_existing = task.get('overwriteExisting', False)
+
+        update_task(task_id, "processing", 5, "正在筛选最佳视频源...")
+
+        target_url = select_best_stream(urls)
+        if not target_url:
+            update_task(task_id, "error", 0, "未找到有效视频流")
+            return
+
+        logger.info(f"筛选结果: {target_url}")
+
+        result = processor.step_generate_note(
+            url=target_url,
+            course_name=course_name,
+            lesson_title=lesson_title,
+            skip_existing=not overwrite_existing,
+            progress_callback=progress_callback,
+            cancel_callback=should_cancel
+        )
+        _handle_step_result(task_id, result, 'note')
+
+    elif task_type == 'transcribe':
+        urls = task.get('urls', [])
+        course_name = task['courseName']
+        lesson_title = task['lessonTitle']
+        overwrite_existing = task.get('overwriteExisting', False)
+        audio_path = task.get('audioPath')
+
+        if urls:
+            target_url = select_best_stream(urls)
+        else:
+            target_url = task.get('url', '')
+
+        if audio_path and Path(audio_path).exists():
+            update_task(task_id, "processing", 10, "使用已有音频文件进行转录...")
+            result = processor.step_transcribe_from_audio(
+                audio_path=audio_path,
+                course_name=course_name,
+                lesson_title=lesson_title,
+                skip_existing=not overwrite_existing,
+                progress_callback=progress_callback,
+                cancel_callback=should_cancel
+            )
+        elif target_url:
+            result = processor.step_transcribe(
+                url=target_url,
+                course_name=course_name,
+                lesson_title=lesson_title,
+                skip_existing=not overwrite_existing,
+                progress_callback=progress_callback,
+                cancel_callback=should_cancel
+            )
+        else:
+            update_task(task_id, "error", 0, "未提供视频链接或音频文件")
+            return
+
+        _handle_step_result(task_id, result, 'transcribe')
+
+    elif task_type == 'download':
+        urls = task.get('urls', [])
+        course_name = task.get('courseName', task.get('filename', 'download'))
+        lesson_title = task.get('lessonTitle', task.get('filename', 'file'))
+        overwrite_existing = task.get('overwriteExisting', False)
+        file_type = task.get('fileType', 'audio').lower()
+
+        with task_lock:
+            if task_id in task_status:
+                task_status[task_id]["fileType"] = file_type
+
+        if urls:
+            target_url = select_best_stream(urls)
+        else:
+            target_url = task.get('url', '')
+
+        if not target_url:
+            update_task(task_id, "error", 0, "未提供下载链接")
+            return
+
+        result = processor.step_download(
+            url=target_url,
+            course_name=course_name,
+            lesson_title=lesson_title,
+            skip_existing=not overwrite_existing,
+            media_type=file_type,
+            progress_callback=progress_callback,
+            cancel_callback=should_cancel
+        )
+        _handle_step_result(task_id, result, 'download')
+
+    elif task_type == 'generate-note':
+        course_name = task['courseName']
+        lesson_title = task['lessonTitle']
+        subtitle_path = task.get('subtitlePath')
+        video_url = task.get('videoUrl', '')
+        overwrite_existing = task.get('overwriteExisting', False)
+
+        update_task(task_id, "processing", 10, "检查文件状态...")
+        existing = processor.check_existing_files(course_name, lesson_title)
+
+        if not subtitle_path:
+            subtitle_path = existing.get('subtitle_path')
+
+        if not subtitle_path or not os.path.exists(subtitle_path):
+            update_task(task_id, "error", 0, "字幕文件不存在，请先转录")
+            return
+
+        if existing['note_exists'] and not overwrite_existing:
+            update_task(task_id, "completed", 100, f"笔记已存在，已跳过: {existing['note_path']}")
+            with task_lock:
+                if task_id in task_status:
+                    task_status[task_id]["skipped"] = True
+                    task_status[task_id]["notePath"] = existing['note_path']
+            return
+
+        try:
+            with open(subtitle_path, 'r', encoding='utf-8') as f:
+                transcript_text = f.read()
+        except Exception as e:
+            update_task(task_id, "error", 0, f"读取字幕失败: {e}")
+            return
+
+        update_task(task_id, "processing", 30, "Gemini 生成笔记中...")
+
+        if should_cancel():
+            update_task(task_id, "cancelled", 0, "任务已取消")
+            return
+
+        try:
+            note_content = processor.process_with_gemini_text(transcript_text)
+        except Exception as e:
+            update_task(task_id, "error", 0, f"Gemini 生成失败: {e}")
+            return
+
+        if should_cancel():
+            update_task(task_id, "cancelled", 0, "任务已取消")
+            return
+
+        update_task(task_id, "processing", 80, "保存笔记...")
+
+        try:
+            formatted_name = existing['formatted_name']
+            note_path = processor.save_to_obsidian(
+                course_name, lesson_title, video_url, note_content, formatted_name
+            )
+            update_task(task_id, "completed", 100, f"笔记生成完成: {note_path}")
+            with task_lock:
+                if task_id in task_status:
+                    task_status[task_id]["notePath"] = str(note_path)
+        except Exception as e:
+            update_task(task_id, "error", 0, f"保存失败: {e}")
+
 def worker():
     """后台任务处理线程"""
     processor = CoreProcessor()
@@ -72,195 +350,13 @@ def worker():
             break
         
         task_id = task['id']
-        task_type = task['type']
-        
-        def should_cancel():
-            return is_task_cancelled(task_id)
-        
-        # 检查任务是否已被取消
-        if should_cancel():
-            logger.info(f"[Task {task_id}] 已被取消，跳过执行")
-            update_task(task_id, "cancelled", 0, "任务已取消")
-            task_queue.task_done()
-            continue
-        
         try:
-            # 定义通用回调函数（智能更新 actionLabel）
-            def progress_callback(status, pct, msg):
-                update_task(task_id, status, pct, msg)
-                # 根据消息内容动态更新 actionLabel，让前端显示当前步骤
-                with task_lock:
-                    if task_id in task_status:
-                        if "下载" in msg or "downloading" in status.lower():
-                            task_status[task_id]["actionLabel"] = "下载音频 (步骤1/3)"
-                        elif "转录" in msg or "transcribe" in msg.lower():
-                            task_status[task_id]["actionLabel"] = "转录音频 (步骤2/3)"
-                        elif "Gemini" in msg or "生成笔记" in msg or "生成中" in msg:
-                            task_status[task_id]["actionLabel"] = "生成 AI 笔记 (步骤3/3)"
-            
-            if task_type == 'note':
-                # ========== 生成笔记任务（完整流程：下载→转录→生成）==========
-                urls = task['urls']
-                course_name = task['courseName']
-                lesson_title = task['lessonTitle']
-                skip_existing = task.get('skipExisting', True)  # 默认跳过已存在的
-                
-                update_task(task_id, "processing", 5, "正在筛选最佳视频源...")
-                
-                target_url = select_best_stream(urls)
-                if not target_url:
-                    update_task(task_id, "error", 0, "未找到有效视频流")
-                    continue
-                    
-                logger.info(f"筛选结果: {target_url}")
-                
-                # 调用 step_generate_note（内部会自动调用下载和转录）
-                result = processor.step_generate_note(
-                    url=target_url, 
-                    course_name=course_name, 
-                    lesson_title=lesson_title,
-                    skip_existing=skip_existing,
-                    progress_callback=progress_callback,
-                    cancel_callback=should_cancel
-                )
-
-                _handle_step_result(task_id, result, 'note')
-
-            elif task_type == 'transcribe':
-                # ========== 转录任务（会先确保音频已下载）==========
-                urls = task.get('urls', [])
-                course_name = task['courseName']
-                lesson_title = task['lessonTitle']
-                skip_existing = task.get('skipExisting', True)
-                audio_path = task.get('audioPath')  # 可能由 transcribe-only 传入
-                
-                # 获取 URL
-                if urls:
-                    target_url = select_best_stream(urls)
-                else:
-                    target_url = task.get('url', '')
-                
-                # 如果提供了 audioPath 且文件存在，直接转录，不需要 URL
-                if audio_path and Path(audio_path).exists():
-                    update_task(task_id, "processing", 10, "使用已有音频文件进行转录...")
-                    result = processor.step_transcribe_from_audio(
-                        audio_path=audio_path,
-                        course_name=course_name,
-                        lesson_title=lesson_title,
-                        skip_existing=skip_existing,
-                        progress_callback=progress_callback,
-                        cancel_callback=should_cancel
-                    )
-                elif target_url:
-                    # 调用 step_transcribe（内部会自动调用下载）
-                    result = processor.step_transcribe(
-                        url=target_url,
-                        course_name=course_name,
-                        lesson_title=lesson_title,
-                        skip_existing=skip_existing,
-                        progress_callback=progress_callback,
-                        cancel_callback=should_cancel
-                    )
-                else:
-                    update_task(task_id, "error", 0, "未提供视频链接或音频文件")
-                    continue
-                
-                _handle_step_result(task_id, result, 'transcribe')
-            
-            elif task_type == 'download':
-                # ========== 仅下载任务 ==========
-                urls = task.get('urls', [])
-                course_name = task.get('courseName', task.get('filename', 'download'))
-                lesson_title = task.get('lessonTitle', task.get('filename', 'file'))
-                skip_existing = task.get('skipExisting', False)  # 下载默认不跳过，询问用户
-                
-                # 获取 URL
-                if urls:
-                    target_url = select_best_stream(urls)
-                else:
-                    target_url = task.get('url', '')
-                
-                if not target_url:
-                    update_task(task_id, "error", 0, "未提供下载链接")
-                    continue
-                
-                result = processor.step_download(
-                    url=target_url,
-                    course_name=course_name,
-                    lesson_title=lesson_title,
-                    skip_existing=skip_existing,
-                    progress_callback=progress_callback,
-                    cancel_callback=should_cancel
-                )
-                
-                _handle_step_result(task_id, result, 'download')
-
-            elif task_type == 'generate-note':
-                # ========== 仅生成笔记（需要字幕已存在）==========
-                course_name = task['courseName']
-                lesson_title = task['lessonTitle']
-                subtitle_path = task.get('subtitlePath')
-                video_url = task.get('videoUrl', '')
-                skip_existing = task.get('skipExisting', True)
-                
-                update_task(task_id, "processing", 10, "检查文件状态...")
-                
-                # 如果提供了字幕路径，直接使用；否则检测已有文件
-                existing = processor.check_existing_files(course_name, lesson_title)
-                
-                if not subtitle_path:
-                    subtitle_path = existing.get('subtitle_path')
-                
-                if not subtitle_path or not os.path.exists(subtitle_path):
-                    update_task(task_id, "error", 0, "字幕文件不存在，请先转录")
-                    continue
-                
-                # 检查笔记是否已存在
-                if existing['note_exists'] and skip_existing:
-                    update_task(task_id, "completed", 100, f"笔记已存在，已跳过: {existing['note_path']}")
-                    with task_lock:
-                        if task_id in task_status:
-                            task_status[task_id]["skipped"] = True
-                            task_status[task_id]["notePath"] = existing['note_path']
-                    continue
-                
-                # 读取字幕
-                try:
-                    with open(subtitle_path, 'r', encoding='utf-8') as f:
-                        transcript_text = f.read()
-                except Exception as e:
-                    update_task(task_id, "error", 0, f"读取字幕失败: {e}")
-                    continue
-                
-                update_task(task_id, "processing", 30, "Gemini 生成笔记中...")
-                
-                if should_cancel():
-                    update_task(task_id, "cancelled", 0, "任务已取消")
-                    continue
-                
-                try:
-                    note_content = processor.process_with_gemini_text(transcript_text)
-                except Exception as e:
-                    update_task(task_id, "error", 0, f"Gemini 生成失败: {e}")
-                    continue
-                
-                if should_cancel():
-                    update_task(task_id, "cancelled", 0, "任务已取消")
-                    continue
-                
-                update_task(task_id, "processing", 80, "保存笔记...")
-                
-                try:
-                    formatted_name = existing['formatted_name']
-                    note_path = processor.save_to_obsidian(
-                        course_name, lesson_title, video_url, note_content, formatted_name
-                    )
-                    update_task(task_id, "completed", 100, f"笔记生成完成: {note_path}")
-                    with task_lock:
-                        if task_id in task_status:
-                            task_status[task_id]["notePath"] = str(note_path)
-                except Exception as e:
-                    update_task(task_id, "error", 0, f"保存失败: {e}")
+            resource_lock = get_resource_lock(task.get("resourceKey"))
+            if resource_lock is None:
+                process_task(task, processor)
+            else:
+                with resource_lock:
+                    process_task(task, processor)
 
         except Exception as e:
             logger.error(f"任务执行异常 [{task_id}]: {e}")
@@ -281,15 +377,7 @@ def _handle_step_result(task_id, result, step_type):
     
     if not result.get("success"):
         error_msg = result.get("error", "执行失败")
-        # 如果是 exists 状态（需要用户确认）
-        if result.get("exists") and not result.get("skipped"):
-            update_task(task_id, "pending_confirm", 50, result.get("message", "文件已存在，等待确认"))
-            with task_lock:
-                if task_id in task_status:
-                    task_status[task_id]["needConfirm"] = True
-                    task_status[task_id]["existingPath"] = result.get("audio_path") or result.get("subtitle_path") or result.get("note_path")
-        else:
-            update_task(task_id, "error", 0, error_msg)
+        update_task(task_id, "error", 0, error_msg)
         return
     
     # 成功
@@ -303,6 +391,8 @@ def _handle_step_result(task_id, result, step_type):
             
             if result.get("audio_path"):
                 task_status[task_id]["audioPath"] = result["audio_path"]
+            if result.get("video_path"):
+                task_status[task_id]["videoPath"] = result["video_path"]
             if result.get("subtitle_path"):
                 task_status[task_id]["subtitlePath"] = result["subtitle_path"]
             if result.get("transcript_path"):
@@ -312,10 +402,13 @@ def _handle_step_result(task_id, result, step_type):
     
     # 生成完成消息
     if step_type == 'download':
+        media_type = result.get("media_type", "audio")
+        target_path = result.get("video_path") if media_type == "video" else result.get("audio_path")
+        media_label = "视频" if media_type == "video" else "音频"
         if skipped:
-            msg = f"音频已存在，已跳过: {result.get('audio_path')}"
+            msg = f"{media_label}已存在，已跳过: {target_path}"
         else:
-            msg = f"下载完成: {result.get('audio_path')}"
+            msg = f"下载完成: {target_path}"
     elif step_type == 'transcribe':
         if skipped:
             msg = f"字幕已存在，已跳过: {result.get('subtitle_path')}"
@@ -340,37 +433,41 @@ def process_video():
     urls = data.get('urls', [])
     course_name = data.get('courseName', 'Default_Course')
     lesson_title = data.get('lessonTitle', 'Untitled_Lesson')
-    force_regenerate = data.get('forceRegenerate', False)  # 是否强制重新生成（不跳过已存在的）
+    force_regenerate = data.get('forceRegenerate', data.get('overwriteExisting', False))
     
     if not urls:
         return jsonify({"status": "error", "message": "未收到视频链接"}), 400
 
-    task_id = str(uuid.uuid4())
     action_label = "生成 AI 笔记"
     display_title = f"{course_name} · {lesson_title}"
-    init_task_record(
-        task_id,
+    resource_key = build_task_resource_key("note", course_name, lesson_title)
+    task_identity = build_task_identity_key("note", course_name, lesson_title)
+
+    task_id, reused = enqueue_managed_task(
         task_type="note",
         action_label=action_label,
         display_title=display_title,
+        task_payload={
+            'urls': urls,
+            'courseName': course_name,
+            'lessonTitle': lesson_title,
+            'overwriteExisting': force_regenerate,
+        },
         extra={
             "courseName": course_name,
             "lessonTitle": lesson_title,
             "urlCount": len(urls),
-            "forceRegenerate": force_regenerate
-        }
+            "overwriteExisting": force_regenerate,
+        },
+        resource_key=resource_key,
+        task_identity=task_identity,
     )
     
-    task_queue.put({
-        'id': task_id,
-        'type': 'note',
-        'urls': urls,
-        'courseName': course_name,
-        'lessonTitle': lesson_title,
-        'skipExisting': not force_regenerate  # 强制重新生成时不跳过
+    return jsonify({
+        "status": "success",
+        "task_id": task_id,
+        "message": "同类任务已在执行，已复用现有任务" if reused else "任务已加入队列"
     })
-    
-    return jsonify({"status": "success", "task_id": task_id, "message": "任务已加入队列"})
 
 @app.route('/download', methods=['POST'])
 def download_local():
@@ -378,32 +475,45 @@ def download_local():
     url = data.get('url')
     filename = data.get('filename', 'downloaded_file')
     file_type = data.get('type', 'video')
+    course_name = data.get('courseName', filename)
+    lesson_title = data.get('lessonTitle', filename)
+    overwrite_existing = data.get('overwriteExisting', False)
     
     if not url:
         return jsonify({"status": "error", "message": "No URL provided"}), 400
     
-    task_id = str(uuid.uuid4())
     action_label = "下载音频 (本地)" if file_type == 'audio' else "下载视频 (本地)"
-    display_title = filename
-    init_task_record(
-        task_id,
+    display_title = f"{course_name} · {lesson_title}"
+    resource_key = build_task_resource_key("download", course_name, lesson_title, file_type)
+    task_identity = build_task_identity_key("download", course_name, lesson_title, file_type)
+
+    task_id, reused = enqueue_managed_task(
         task_type="download",
         action_label=action_label,
         display_title=display_title,
+        task_payload={
+            'url': url,
+            'filename': filename,
+            'courseName': course_name,
+            'lessonTitle': lesson_title,
+            'fileType': file_type,
+            'overwriteExisting': overwrite_existing,
+        },
         extra={
-            "fileType": file_type
-        }
+            "fileType": file_type,
+            "courseName": course_name,
+            "lessonTitle": lesson_title,
+            "overwriteExisting": overwrite_existing,
+        },
+        resource_key=resource_key,
+        task_identity=task_identity,
     )
     
-    task_queue.put({
-        'id': task_id,
-        'type': 'download',
-        'url': url,
-        'filename': filename,
-        'fileType': file_type
+    return jsonify({
+        "status": "success",
+        "task_id": task_id,
+        "message": "同类任务已在执行，已复用现有任务" if reused else "任务已加入队列"
     })
-    
-    return jsonify({"status": "success", "task_id": task_id, "message": "任务已加入队列"})
 
 @app.route('/tasks/<task_id>', methods=['GET'])
 def get_task_status(task_id):
@@ -435,7 +545,7 @@ def cancel_task(task_id):
         current_status = task_status[task_id]['status']
         
         # 如果任务还在队列中或正在处理，标记为取消
-        if current_status in ['queued', 'processing', 'downloading']:
+        if current_status in ACTIVE_TASK_STATUSES:
             cancelled_tasks.add(task_id)
             task_status[task_id]['status'] = 'cancelled'
             task_status[task_id]['message'] = '任务已取消'
@@ -444,7 +554,7 @@ def cancel_task(task_id):
             return jsonify({"status": "success", "message": "任务已取消"})
         
         # 如果任务已完成或已出错，直接从列表中删除
-        elif current_status in ['completed', 'error', 'cancelled']:
+        elif current_status in TERMINAL_TASK_STATUSES:
             del task_status[task_id]
             if task_id in cancelled_tasks:
                 cancelled_tasks.discard(task_id)
@@ -458,10 +568,9 @@ def clear_tasks():
     """清空所有已完成/已出错的任务"""
     with task_lock:
         # 只保留正在进行的任务
-        active_statuses = ['queued', 'processing', 'downloading']
         tasks_to_remove = [
             tid for tid, info in task_status.items() 
-            if info['status'] not in active_statuses
+            if info['status'] not in ACTIVE_TASK_STATUSES
         ]
         
         for tid in tasks_to_remove:
@@ -484,40 +593,34 @@ def check_files():
     lesson_title = data.get('lessonTitle', 'Untitled_Lesson')
     
     processor = CoreProcessor()
-    formatted_name = processor.parse_metadata(course_name, lesson_title)
-    
-    from core_processor import DOWNLOAD_DIR, OBSIDIAN_VAULT_PATH
-    
-    audio_path = Path(DOWNLOAD_DIR) / f"{formatted_name}.m4a"
-    srt_path = Path(DOWNLOAD_DIR) / f"{formatted_name}.srt"
-    txt_path = Path(DOWNLOAD_DIR) / f"{formatted_name}.txt"
-    note_dir = Path(OBSIDIAN_VAULT_PATH) / course_name
-    note_path = note_dir / f"{formatted_name}.md"
-    
-    # 检查音频完整性（大于1MB认为完整）
-    audio_complete = False
-    if audio_path.exists():
-        try:
-            audio_size = audio_path.stat().st_size
-            audio_complete = audio_size > 1024 * 1024  # 1MB
-        except:
-            pass
+    existing = processor.check_existing_files(course_name, lesson_title)
+
+    audio_path = Path(existing["audio_path"]) if existing.get("audio_path") else None
+    video_path = Path(existing["video_path"]) if existing.get("video_path") else None
+    subtitle_path = Path(existing["subtitle_path"]) if existing.get("subtitle_path") else None
+    txt_path = subtitle_path if subtitle_path and subtitle_path.suffix == ".txt" else None
+    srt_path = subtitle_path if subtitle_path and subtitle_path.suffix == ".srt" else None
+    note_path = Path(existing["note_path"]) if existing.get("note_path") else None
     
     return jsonify({
-        "audioExists": audio_path.exists(),
-        "audioSize": audio_path.stat().st_size if audio_path.exists() else 0,
-        "audioComplete": audio_complete,
-        "subtitleExists": srt_path.exists() or txt_path.exists(),
-        "srtExists": srt_path.exists(),
-        "txtExists": txt_path.exists(),
-        "txtRequired": not txt_path.exists(),  # Gemini 需要 TXT 格式
-        "noteExists": note_path.exists(),
-        "formattedName": formatted_name,
+        "audioExists": bool(audio_path and audio_path.exists()),
+        "audioSize": audio_path.stat().st_size if audio_path and audio_path.exists() else 0,
+        "audioComplete": existing.get("audio_complete", False),
+        "videoExists": bool(video_path and video_path.exists()),
+        "videoSize": video_path.stat().st_size if video_path and video_path.exists() else 0,
+        "videoComplete": existing.get("video_complete", False),
+        "subtitleExists": bool(subtitle_path and subtitle_path.exists()),
+        "srtExists": bool(srt_path and srt_path.exists()),
+        "txtExists": bool(txt_path and txt_path.exists()),
+        "txtRequired": not bool(txt_path and txt_path.exists()),
+        "noteExists": bool(note_path and note_path.exists()),
+        "formattedName": existing["formatted_name"],
         "paths": {
-            "audio": str(audio_path),
-            "srt": str(srt_path) if srt_path.exists() else None,
-            "txt": str(txt_path) if txt_path.exists() else None,  # Gemini 需要这个
-            "note": str(note_path) if note_path.exists() else None
+            "audio": str(audio_path) if audio_path else None,
+            "video": str(video_path) if video_path else None,
+            "srt": str(srt_path) if srt_path else None,
+            "txt": str(txt_path) if txt_path else None,
+            "note": str(note_path) if note_path else None
         }
     })
 
@@ -528,6 +631,7 @@ def transcribe():
     urls = data.get('urls', [])
     course_name = data.get('courseName', 'Default_Course')
     lesson_title = data.get('lessonTitle', 'Untitled_Lesson')
+    overwrite_existing = data.get('overwriteExisting', False)
     
     # 如果没有提供 URL，尝试从已有音频转录
     if not urls:
@@ -540,30 +644,36 @@ def transcribe():
                 "message": "未提供视频链接且音频文件不存在"
             }), 400
     
-    task_id = str(uuid.uuid4())
     action_label = "转录音频"
     display_title = f"{course_name} · {lesson_title}"
-    init_task_record(
-        task_id,
+    resource_key = build_task_resource_key("transcribe", course_name, lesson_title)
+    task_identity = build_task_identity_key("transcribe", course_name, lesson_title)
+
+    task_id, reused = enqueue_managed_task(
         task_type="transcribe",
         action_label=action_label,
         display_title=display_title,
+        task_payload={
+            'urls': urls,
+            'courseName': course_name,
+            'lessonTitle': lesson_title,
+            'overwriteExisting': overwrite_existing,
+        },
         extra={
             "courseName": course_name,
             "lessonTitle": lesson_title,
-            "urlCount": len(urls)
-        }
+            "urlCount": len(urls),
+            "overwriteExisting": overwrite_existing,
+        },
+        resource_key=resource_key,
+        task_identity=task_identity,
     )
     
-    task_queue.put({
-        'id': task_id,
-        'type': 'transcribe',
-        'urls': urls,
-        'courseName': course_name,
-        'lessonTitle': lesson_title
+    return jsonify({
+        "status": "success",
+        "task_id": task_id,
+        "message": "同类任务已在执行，已复用现有任务" if reused else "转录任务已加入队列"
     })
-    
-    return jsonify({"status": "success", "task_id": task_id, "message": "转录任务已加入队列"})
 
 @app.route('/transcribe-only', methods=['POST'])
 def transcribe_only():
@@ -572,6 +682,7 @@ def transcribe_only():
     course_name = data.get('courseName', 'Default_Course')
     lesson_title = data.get('lessonTitle', 'Untitled_Lesson')
     audio_path = data.get('audioPath')  # 可选：指定音频路径
+    overwrite_existing = data.get('overwriteExisting', False)
     
     processor = CoreProcessor()
     formatted_name = processor.parse_metadata(course_name, lesson_title)
@@ -589,31 +700,37 @@ def transcribe_only():
             "message": f"音频文件不存在: {audio_path}"
         }), 400
     
-    task_id = str(uuid.uuid4())
     action_label = "转录音频"
     display_title = f"{course_name} · {lesson_title}"
-    init_task_record(
-        task_id,
+    resource_key = build_task_resource_key("transcribe", course_name, lesson_title)
+    task_identity = build_task_identity_key("transcribe", course_name, lesson_title)
+
+    task_id, reused = enqueue_managed_task(
         task_type="transcribe",
         action_label=action_label,
         display_title=display_title,
+        task_payload={
+            'courseName': course_name,
+            'lessonTitle': lesson_title,
+            'audioPath': audio_path,
+            'outputDir': DOWNLOAD_DIR,
+            'overwriteExisting': overwrite_existing,
+        },
         extra={
             "courseName": course_name,
             "lessonTitle": lesson_title,
-            "audioPath": audio_path
-        }
+            "audioPath": audio_path,
+            "overwriteExisting": overwrite_existing,
+        },
+        resource_key=resource_key,
+        task_identity=task_identity,
     )
     
-    task_queue.put({
-        'id': task_id,
-        'type': 'transcribe',
-        'courseName': course_name,
-        'lessonTitle': lesson_title,
-        'audioPath': audio_path,
-        'outputDir': DOWNLOAD_DIR
+    return jsonify({
+        "status": "success",
+        "task_id": task_id,
+        "message": "同类任务已在执行，已复用现有任务" if reused else "转录任务已加入队列"
     })
-    
-    return jsonify({"status": "success", "task_id": task_id, "message": "转录任务已加入队列"})
 
 @app.route('/generate-note-only', methods=['POST'])
 def generate_note_only():
@@ -623,6 +740,7 @@ def generate_note_only():
     lesson_title = data.get('lessonTitle', 'Untitled_Lesson')
     subtitle_path = data.get('subtitlePath')  # 可选：指定字幕路径
     video_url = data.get('videoUrl', '')  # 原始视频链接
+    overwrite_existing = data.get('overwriteExisting', False)
     
     processor = CoreProcessor()
     formatted_name = processor.parse_metadata(course_name, lesson_title)
@@ -667,31 +785,37 @@ def generate_note_only():
             "message": f"字幕文件不存在: {subtitle_path}"
         }), 400
     
-    task_id = str(uuid.uuid4())
     action_label = "生成 AI 笔记"
     display_title = f"{course_name} · {lesson_title}"
-    init_task_record(
-        task_id,
+    resource_key = build_task_resource_key("generate-note", course_name, lesson_title)
+    task_identity = build_task_identity_key("generate-note", course_name, lesson_title)
+
+    task_id, reused = enqueue_managed_task(
         task_type="generate-note",
         action_label=action_label,
         display_title=display_title,
+        task_payload={
+            'courseName': course_name,
+            'lessonTitle': lesson_title,
+            'subtitlePath': subtitle_path,
+            'videoUrl': video_url,
+            'overwriteExisting': overwrite_existing,
+        },
         extra={
             "courseName": course_name,
             "lessonTitle": lesson_title,
-            "subtitlePath": subtitle_path
-        }
+            "subtitlePath": subtitle_path,
+            "overwriteExisting": overwrite_existing,
+        },
+        resource_key=resource_key,
+        task_identity=task_identity,
     )
     
-    task_queue.put({
-        'id': task_id,
-        'type': 'generate-note',
-        'courseName': course_name,
-        'lessonTitle': lesson_title,
-        'subtitlePath': subtitle_path,
-        'videoUrl': video_url
+    return jsonify({
+        "status": "success",
+        "task_id": task_id,
+        "message": "同类任务已在执行，已复用现有任务" if reused else "笔记生成任务已加入队列"
     })
-    
-    return jsonify({"status": "success", "task_id": task_id, "message": "笔记生成任务已加入队列"})
 
 @app.route('/ping', methods=['GET'])
 def ping():

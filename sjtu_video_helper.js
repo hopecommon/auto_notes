@@ -33,10 +33,75 @@
     let activeTasks = new Map(); // task_id -> polling interval
     const SERVER_URL = "http://localhost:5000";
     let tasksRestored = false; // 标记是否已从服务器恢复任务
+    const PANEL_ID = "sjtu-ai-helper-pro-panel";
+    let actionButtons = [];
+    const PANEL_SELECTORS = [
+        "#sjtu-ai-helper-panel",
+        "#sjtu-ai-helper-pro-panel",
+        ".ai-helper-panel",
+        ".ai-helper-pro-panel",
+    ];
 
     function resetTaskPolling() {
         activeTasks.forEach((interval) => clearInterval(interval));
         activeTasks.clear();
+    }
+
+    function reconcilePanels() {
+        const seen = new Set();
+        const candidates = [];
+
+        PANEL_SELECTORS.forEach((selector) => {
+            document.querySelectorAll(selector).forEach((el) => {
+                if (!seen.has(el)) {
+                    seen.add(el);
+                    candidates.push(el);
+                }
+            });
+        });
+
+        let activePanel = null;
+        candidates.forEach((panel) => {
+            const isCurrentPanel =
+                panel.id === PANEL_ID ||
+                panel.getAttribute("data-script") === SCRIPT_ID;
+            if (isCurrentPanel && !activePanel) {
+                activePanel = panel;
+                return;
+            }
+            panel.remove();
+        });
+
+        panelCreated = Boolean(activePanel);
+        return activePanel;
+    }
+
+    function isTaskSubmissionPage() {
+        const url = window.location.href;
+        if (
+            url.includes("/login") ||
+            url.includes("/dashboard") ||
+            url === "https://oc.sjtu.edu.cn/"
+        ) {
+            return false;
+        }
+        return (
+            url.includes("/courses/") ||
+            url.includes("/lti/") ||
+            url.includes("/v.sjtu.edu.cn/")
+        );
+    }
+
+    function updateActionAvailability() {
+        const canSubmit = isTaskSubmissionPage() && detectedUrls.size > 0;
+        actionButtons.forEach((btn) => {
+            const requiresVideo = btn.dataset.requiresVideo === "true";
+            const disabled = requiresVideo && !canSubmit;
+            btn.disabled = disabled;
+            btn.style.opacity = disabled ? "0.45" : "1";
+            btn.style.cursor = disabled ? "not-allowed" : "pointer";
+            btn.style.pointerEvents = disabled ? "none" : "auto";
+        });
     }
 
     // ============================================================
@@ -252,13 +317,20 @@
     `);
 
     function createPanel(force = false) {
-        const panelId = "sjtu-ai-helper-pro-panel"; // 使用更独特的 ID
+        const activePanel = reconcilePanels();
+        if (activePanel) {
+            console.log("[AI助手 Pro] 面板已存在，复用当前面板");
+            updateActionAvailability();
+            return activePanel;
+        }
 
         // 多重检查确保唯一性
-        const existing = document.getElementById(panelId);
+        const existing = document.getElementById(PANEL_ID);
         if (existing) {
             console.log("[AI助手 Pro] 面板已存在，跳过创建");
-            return;
+            panelCreated = true;
+            updateActionAvailability();
+            return existing;
         }
 
         // 检查是否有同类面板（通过 class 名）
@@ -283,7 +355,7 @@
         console.log("[AI助手 Pro] 开始创建面板...");
 
         const panel = document.createElement("div");
-        panel.id = panelId;
+        panel.id = PANEL_ID;
         panel.className = "ai-helper-pro-panel glass-effect"; // 使用唯一类名
         panel.setAttribute("data-script", SCRIPT_ID); // 标记所属脚本
         panel.setAttribute("data-version", "3.1.1"); // 标记版本
@@ -380,7 +452,7 @@
             font-weight: 600;
             box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
         `;
-        status.innerHTML = `✨ 已检测 ${detectedUrls.size} 个视频源`;
+        status.innerHTML = "🔄 正在连接任务服务...";
         content.appendChild(status);
 
         // 按钮组（优化样式）
@@ -393,7 +465,8 @@
                 "🤖",
                 "生成 AI 笔记",
                 () => handleAction("note"),
-                "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
+                "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                { requiresVideo: true }
             )
         );
         btnGroup.appendChild(
@@ -401,7 +474,8 @@
                 "🎵",
                 "下载音频",
                 () => handleAction("audio"),
-                "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)"
+                "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)",
+                { requiresVideo: true }
             )
         );
         btnGroup.appendChild(
@@ -409,7 +483,8 @@
                 "📝",
                 "转录音频",
                 () => handleTranscribeAction(),
-                "linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)"
+                "linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)",
+                { requiresVideo: true }
             )
         );
         btnGroup.appendChild(
@@ -417,7 +492,8 @@
                 "🎬",
                 "下载视频",
                 () => handleAction("video"),
-                "linear-gradient(135deg, #fa709a 0%, #fee140 100%)"
+                "linear-gradient(135deg, #fa709a 0%, #fee140 100%)",
+                { requiresVideo: true }
             )
         );
 
@@ -426,7 +502,9 @@
         toolsGroup.style.cssText =
             "display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px;";
         toolsGroup.appendChild(
-            createSmallBtn("📋", "复制链接", () => copyVideoLink())
+            createSmallBtn("📋", "复制链接", () => copyVideoLink(), {
+                requiresVideo: true,
+            })
         );
         toolsGroup.appendChild(
             createSmallBtn("🗑️", "清空完成", () => clearFinishedTasks())
@@ -451,12 +529,15 @@
         panel.appendChild(content);
         document.body.appendChild(panel);
         console.log("[AI助手] 精美面板已创建");
+        updateButtonState();
+        return panel;
     }
 
     // 现代化主按钮
-    function createModernBtn(icon, text, onClick, gradient) {
+    function createModernBtn(icon, text, onClick, gradient, options = {}) {
         const btn = document.createElement("button");
         btn.className = "ai-helper-btn";
+        btn.dataset.requiresVideo = options.requiresVideo ? "true" : "false";
         btn.style.cssText = `
             cursor: pointer;
             padding: 12px 16px;
@@ -488,13 +569,15 @@
             btn.style.boxShadow = "0 2px 8px rgba(0,0,0,0.1)";
         };
         btn.onclick = onClick;
+        actionButtons.push(btn);
         return btn;
     }
 
     // 小工具按钮
-    function createSmallBtn(icon, text, onClick) {
+    function createSmallBtn(icon, text, onClick, options = {}) {
         const btn = document.createElement("button");
         btn.className = "ai-helper-btn";
+        btn.dataset.requiresVideo = options.requiresVideo ? "true" : "false";
         btn.style.cssText = `
             cursor: pointer;
             padding: 8px 12px;
@@ -523,20 +606,28 @@
             btn.style.background = "white";
         };
         btn.onclick = onClick;
+        actionButtons.push(btn);
         return btn;
     }
 
     function updateButtonState() {
         const status = document.getElementById("sjtu-ai-status");
+        updateActionAvailability();
         if (status) {
-            if (detectedUrls.size > 0) {
+            if (!isTaskSubmissionPage()) {
+                status.innerHTML =
+                    "📋 当前页面仅显示任务状态；切回课程视频页可继续添加任务";
+                status.style.background =
+                    "linear-gradient(135deg, #94a3b8 0%, #64748b 100%)";
+                status.style.color = "white";
+            } else if (detectedUrls.size > 0) {
                 status.innerHTML = `✨ 已检测 <strong>${detectedUrls.size}</strong> 个视频源`;
                 status.style.background =
                     "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
                 status.style.color = "white";
 
                 if (!panelCreated) {
-                    createPanel();
+                    createPanel(true);
                 }
             } else {
                 status.innerHTML = "🔍 等待视频加载中...";
@@ -706,6 +797,10 @@
     }
 
     function pollTaskStatus(taskId) {
+        if (activeTasks.has(taskId)) {
+            return;
+        }
+
         const interval = setInterval(() => {
             GM_xmlhttpRequest({
                 method: "GET",
@@ -723,7 +818,8 @@
                         // 任务完成或出错，停止轮询
                         if (
                             data.status === "completed" ||
-                            data.status === "error"
+                            data.status === "error" ||
+                            data.status === "cancelled"
                         ) {
                             clearInterval(interval);
                             activeTasks.delete(taskId);
@@ -1047,6 +1143,11 @@
     }
 
     async function handleAction(type) {
+        if (!isTaskSubmissionPage()) {
+            alert("当前页面只能查看任务状态，请切回课程视频页后再添加新任务。");
+            return;
+        }
+
         // 再次扫描
         scanVideoTags();
 
@@ -1092,7 +1193,17 @@
             if (!action) {
                 // 用户选择不重新下载，直接转录
                 if (!fileCheck.subtitleExists) {
-                    await handleTranscribeOnly(metadata, fileCheck.paths.audio);
+                    await submitTask(
+                        "/transcribe-only",
+                        {
+                            courseName: metadata.courseName,
+                            lessonTitle: metadata.lessonTitle,
+                            audioPath: fileCheck.paths.audio,
+                            overwriteExisting: false,
+                        },
+                        "转录音频",
+                        metadata.lessonTitle
+                    );
                 } else {
                     alert(
                         "✅ 音频和字幕都已存在！\n" +
@@ -1120,8 +1231,11 @@
             "/download",
             {
                 url: targetUrl,
+                courseName: metadata.courseName,
+                lessonTitle: metadata.lessonTitle,
                 filename: metadata.lessonTitle,
                 type: "audio",
+                overwriteExisting: fileCheck.audioExists && fileCheck.audioComplete,
             },
             "下载音频",
             metadata.lessonTitle
@@ -1131,7 +1245,8 @@
     }
 
     async function handleDownloadVideo(metadata, urlList, fileCheck) {
-        if (fileCheck.videoPath) {
+        const videoExists = fileCheck.videoExists && fileCheck.videoComplete;
+        if (videoExists) {
             if (!confirm(`视频已存在，是否重新下载？`)) {
                 return;
             }
@@ -1150,8 +1265,11 @@
             "/download",
             {
                 url: targetUrl,
+                courseName: metadata.courseName,
+                lessonTitle: metadata.lessonTitle,
                 filename: metadata.lessonTitle,
                 type: "video",
+                overwriteExisting: videoExists,
             },
             "下载视频",
             metadata.lessonTitle
@@ -1222,6 +1340,11 @@
     // 已移除 submitGenerateNoteOnly 函数，现在直接使用 /process 接口
 
     async function handleTranscribeAction() {
+        if (!isTaskSubmissionPage()) {
+            alert("当前页面只能查看任务状态，请切回课程视频页后再添加新任务。");
+            return;
+        }
+
         const metadata = getMetadata();
 
         try {
@@ -1250,6 +1373,7 @@
                     urls: urlList,
                     courseName: metadata.courseName,
                     lessonTitle: metadata.lessonTitle,
+                    overwriteExisting: fileCheck.subtitleExists,
                 },
                 "转录音频",
                 metadata.lessonTitle
@@ -1265,37 +1389,21 @@
     // 5. 原有功能保持
     // ============================================================
 
-    // 检查页面类型，只在课程视频页面运行
-    function isValidPage() {
-        const url = window.location.href;
-        // 排除登录页、主页等非视频页面
-        if (
-            url.includes("/login") ||
-            url.includes("/dashboard") ||
-            url === "https://oc.sjtu.edu.cn/"
-        ) {
-            return false;
-        }
-        // 必须是课程页面或视频页面
-        return (
-            url.includes("/courses/") ||
-            url.includes("/lti/") ||
-            url.includes("/v.sjtu.edu.cn/")
-        );
-    }
-
-    if (!isValidPage()) {
-        console.log("[AI助手 Pro] 非视频页面，脚本不运行");
-        return;
-    }
-
     // 页面加载时立即尝试恢复任务
     setTimeout(() => {
+        createPanel(true);
         restoreTasksFromServer();
+        updateButtonState();
     }, 1500); // 延迟 1.5 秒，避免与其他脚本冲突
 
     // 延迟启动，避免与 canvas_for_refer.js 冲突
     setTimeout(() => {
+        if (!isTaskSubmissionPage()) {
+            console.log("[AI助手 Pro] 当前页面只保持任务面板，不执行视频嗅探");
+            updateButtonState();
+            return;
+        }
+
         console.log("[AI助手 Pro] 开始视频检测...");
 
         // 首次立即扫描
