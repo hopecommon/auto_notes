@@ -76,6 +76,23 @@
         return activePanel;
     }
 
+    function removeManagedPanels() {
+        const seen = new Set();
+
+        PANEL_SELECTORS.forEach((selector) => {
+            document.querySelectorAll(selector).forEach((panel) => {
+                if (seen.has(panel)) {
+                    return;
+                }
+                seen.add(panel);
+                panel.remove();
+            });
+        });
+
+        panelCreated = false;
+        actionButtons = [];
+    }
+
     function hasEmbeddedCourseFrame() {
         if (window.self !== window.top) {
             return false;
@@ -91,6 +108,20 @@
         );
     }
 
+    function isEmbeddedPlaybackPage() {
+        const href = window.location.href;
+        return (
+            /^https:\/\/courses\.sjtu\.edu\.cn\/lti\/app\/lti\/vodVideo\/playPage/.test(
+                href
+            ) ||
+            /^https:\/\/courses\.sjtu\.edu\.cn\/lti\/app\/lti\/liveVideo\/index\.d2j/.test(
+                href
+            ) ||
+            href.startsWith("https://v.sjtu.edu.cn/jy-application-canvas-sjtu-ui/") ||
+            href.startsWith("https://vshare.sjtu.edu.cn/play/")
+        );
+    }
+
     function isTopLevelLtiHostPage() {
         if (window.self !== window.top) {
             return false;
@@ -101,18 +132,24 @@
             /^https:\/\/oc\.sjtu\.edu\.cn\/courses\/\d+\/external_tools\/\d+/.test(
                 href
             );
+        const isOcCourseShell =
+            /^https:\/\/oc\.sjtu\.edu\.cn\/courses\/\d+/.test(href) &&
+            !isEmbeddedPlaybackPage();
         const hasCanvasHostMarkers =
             document.body?.classList.contains("ic-framed-lti-tool") ||
             Boolean(document.getElementById("tool_content")) ||
             Boolean(document.querySelector(".tool_content_wrapper"));
 
-        return isExternalToolPage || hasCanvasHostMarkers;
+        return isExternalToolPage || isOcCourseShell || hasCanvasHostMarkers;
     }
 
     function shouldOwnPanel() {
-        // 顶层页面如果只是一个课程 iframe 容器，不再额外创建自己的面板，
-        // 由 iframe 内实际课程页持有面板，避免一左一右两个 Notes Helper。
-        return !isTopLevelLtiHostPage() && !hasEmbeddedCourseFrame();
+        // 只允许真正的深层播放页持有面板。所有顶层 Canvas 壳页面都禁止创建，
+        // 即使未来页面结构有波动，也优先保证“浅层面板不出现”。
+        if (isTopLevelLtiHostPage() || hasEmbeddedCourseFrame()) {
+            return false;
+        }
+        return isEmbeddedPlaybackPage();
     }
 
     function isTaskSubmissionPage() {
@@ -357,6 +394,7 @@
 
     function createPanel(force = false) {
         if (!shouldOwnPanel()) {
+            removeManagedPanels();
             panelCreated = false;
             return null;
         }
@@ -656,6 +694,7 @@
 
     function updateButtonState() {
         if (!shouldOwnPanel()) {
+            removeManagedPanels();
             panelCreated = false;
             return;
         }
@@ -1442,6 +1481,7 @@
     setTimeout(() => {
         if (!shouldOwnPanel()) {
             console.log("[AI助手 Pro] 当前顶层页面仅承载课程 iframe，跳过自身面板创建");
+            removeManagedPanels();
             return;
         }
 
