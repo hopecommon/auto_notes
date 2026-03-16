@@ -35,12 +35,15 @@
     let tasksRestored = false; // 标记是否已从服务器恢复任务
     const PANEL_ID = "sjtu-ai-helper-pro-panel";
     let actionButtons = [];
+    let playbackMonitorId = null;
+    let playbackContextSignature = "";
     const PANEL_SELECTORS = [
         "#sjtu-ai-helper-panel",
         "#sjtu-ai-helper-pro-panel",
         ".ai-helper-panel",
         ".ai-helper-pro-panel",
     ];
+    const PLAYBACK_MONITOR_INTERVAL_MS = 2000;
 
     function resetTaskPolling() {
         activeTasks.forEach((interval) => clearInterval(interval));
@@ -180,6 +183,139 @@
         });
     }
 
+    function registerDetectedUrl(url, sourceLabel) {
+        if (
+            !url ||
+            typeof url !== "string" ||
+            url.length <= 20 ||
+            url.startsWith("blob:") ||
+            (!url.includes(".mp4") && !url.includes(".m3u8"))
+        ) {
+            return false;
+        }
+
+        if (detectedUrls.has(url)) {
+            return false;
+        }
+
+        console.log(`[AI助手 Pro] ${sourceLabel}:`, url);
+        detectedUrls.add(url);
+        updateButtonState();
+        return true;
+    }
+
+    function getPlaybackContextSignature() {
+        const activeItem = document.querySelector(".lti-list .list-item--active");
+        const activeId =
+            activeItem?.id ||
+            activeItem?.getAttribute("data-id") ||
+            activeItem?.getAttribute("data-video-id") ||
+            "";
+        const activeHref =
+            activeItem?.getAttribute("href") ||
+            activeItem?.querySelector("a")?.getAttribute("href") ||
+            "";
+        const activeText = activeItem?.innerText?.replace(/\s+/g, " ").trim() || "";
+        return [
+            window.location.pathname,
+            window.location.search,
+            document.title.trim(),
+            activeId,
+            activeHref,
+            activeText.slice(0, 120),
+        ].join("||");
+    }
+
+    function resetDetectedUrls(reason = "") {
+        const hadUrls = detectedUrls.size > 0;
+        detectedUrls = new Set();
+        if (hadUrls && reason) {
+            console.log(`[AI助手 Pro] 已清空旧视频源: ${reason}`);
+        }
+        updateButtonState();
+    }
+
+    function syncPlaybackContext(force = false) {
+        const nextSignature = getPlaybackContextSignature();
+        if (!force && nextSignature === playbackContextSignature) {
+            return false;
+        }
+
+        if (
+            playbackContextSignature &&
+            nextSignature !== playbackContextSignature
+        ) {
+            console.log("[AI助手 Pro] 检测到课节切换，重新进入视频检测");
+        }
+
+        playbackContextSignature = nextSignature;
+        resetDetectedUrls("课节上下文变化");
+        return true;
+    }
+
+    function startPlaybackMonitor() {
+        if (playbackMonitorId) {
+            return;
+        }
+
+        playbackMonitorId = setInterval(() => {
+            if (!shouldOwnPanel()) {
+                removeManagedPanels();
+                return;
+            }
+
+            const contextChanged = syncPlaybackContext();
+            if (!isTaskSubmissionPage()) {
+                updateButtonState();
+                return;
+            }
+
+            const found = scanVideoTags();
+            if (contextChanged && found === 0) {
+                updateButtonState();
+            }
+        }, PLAYBACK_MONITOR_INTERVAL_MS);
+    }
+
+    function handlePlaybackRouteChange() {
+        if (!shouldOwnPanel()) {
+            removeManagedPanels();
+            return;
+        }
+
+        const contextChanged = syncPlaybackContext();
+        if (!isTaskSubmissionPage()) {
+            updateButtonState();
+            return;
+        }
+
+        if (contextChanged) {
+            setTimeout(() => {
+                scanVideoTags();
+            }, 300);
+        }
+    }
+
+    function installPlaybackRouteHooks() {
+        const wrapHistoryMethod = (methodName) => {
+            const originalMethod = window.history[methodName];
+            if (typeof originalMethod !== "function") {
+                return;
+            }
+
+            window.history[methodName] = function () {
+                const result = originalMethod.apply(this, arguments);
+                handlePlaybackRouteChange();
+                return result;
+            };
+        };
+
+        wrapHistoryMethod("pushState");
+        wrapHistoryMethod("replaceState");
+        window.addEventListener("popstate", handlePlaybackRouteChange);
+        window.addEventListener("hashchange", handlePlaybackRouteChange);
+    }
+
     // ============================================================
     // 1. 链接嗅探逻辑
     // ============================================================
@@ -188,19 +324,19 @@
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url) {
         // SJTU 视频通常是 .mp4 结尾，或者是 m3u8 流
-        if (
-            (url.includes(".mp4") || url.includes(".m3u8")) &&
-            !url.includes("blob:")
-        ) {
-            // 排除一些无效的短链接或图标
-            if (url.length > 20) {
-                console.log("[AI助手] 网络嗅探捕获链接:", url);
-                detectedUrls.add(url);
-                updateButtonState();
-            }
-        }
+        registerDetectedUrl(url, "网络嗅探捕获链接");
         return originalOpen.apply(this, arguments);
     };
+
+    if (typeof window.fetch === "function") {
+        const originalFetch = window.fetch;
+        window.fetch = function (resource, init) {
+            const requestUrl =
+                typeof resource === "string" ? resource : resource?.url;
+            registerDetectedUrl(requestUrl, "Fetch 嗅探捕获链接");
+            return originalFetch.apply(this, arguments);
+        };
+    }
 
     // 方法B: 主动扫描 DOM 中的 Video 标签 (针对已经加载好的视频)
     function scanVideoTags() {
@@ -210,9 +346,9 @@
         videos.forEach((v) => {
             if (v.src && (v.src.includes("http") || v.src.includes("blob"))) {
                 if (!v.src.startsWith("blob:")) {
-                    console.log("[AI助手 Pro] DOM 扫描发现链接:", v.src);
-                    detectedUrls.add(v.src);
-                    foundCount++;
+                    if (registerDetectedUrl(v.src, "DOM 扫描发现链接")) {
+                        foundCount++;
+                    }
                 }
             }
 
@@ -224,12 +360,9 @@
                     s.src.includes("http") &&
                     !s.src.startsWith("blob:")
                 ) {
-                    console.log(
-                        "[AI助手 Pro] DOM 扫描发现 source 链接:",
-                        s.src
-                    );
-                    detectedUrls.add(s.src);
-                    foundCount++;
+                    if (registerDetectedUrl(s.src, "DOM 扫描发现 source 链接")) {
+                        foundCount++;
+                    }
                 }
             });
         });
@@ -1485,6 +1618,7 @@
             return;
         }
 
+        syncPlaybackContext(true);
         createPanel(true);
         restoreTasksFromServer();
         updateButtonState();
@@ -1492,6 +1626,9 @@
 
     // 延迟启动，避免与 canvas_for_refer.js 冲突
     setTimeout(() => {
+        installPlaybackRouteHooks();
+        startPlaybackMonitor();
+
         if (!isTaskSubmissionPage()) {
             console.log("[AI助手 Pro] 当前页面只保持任务面板，不执行视频嗅探");
             updateButtonState();
@@ -1501,36 +1638,10 @@
         console.log("[AI助手 Pro] 开始视频检测...");
 
         // 首次立即扫描
+        syncPlaybackContext(true);
         const foundInitial = scanVideoTags();
         if (foundInitial > 0 && !panelCreated) {
             createPanel();
         }
-
-        // 定时检测（不再需要 MutationObserver，避免重复触发）
-        let initInterval = setInterval(() => {
-            if (!panelCreated) {
-                const found = scanVideoTags();
-                if (found > 0 || detectedUrls.size > 0) {
-                    createPanel();
-                    clearInterval(initInterval);
-                }
-            } else {
-                clearInterval(initInterval);
-            }
-        }, 3000); // 每 3 秒检测一次
-
-        // 15秒后停止检测，避免一直运行
-        setTimeout(() => {
-            clearInterval(initInterval);
-            if (detectedUrls.size > 0) {
-                console.log(
-                    `[AI助手 Pro] 初始化完成，共检测到 ${detectedUrls.size} 个视频源`
-                );
-            } else {
-                console.log(
-                    "[AI助手 Pro] 初始化完成，未检测到视频（可能需要播放视频）"
-                );
-            }
-        }, 15000);
     }, 2000); // 延迟 2 秒启动，让 canvas_for_refer.js 先运行
 })();
