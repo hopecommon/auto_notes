@@ -76,6 +76,27 @@
         return activePanel;
     }
 
+    function hasEmbeddedCourseFrame() {
+        if (window.self !== window.top) {
+            return false;
+        }
+
+        const frameSelectors = [
+            'iframe[src*="courses.sjtu.edu.cn"]',
+            'iframe[src*="v.sjtu.edu.cn"]',
+            'iframe[src*="oc.sjtu.edu.cn"]',
+        ];
+        return frameSelectors.some((selector) =>
+            document.querySelector(selector)
+        );
+    }
+
+    function shouldOwnPanel() {
+        // 顶层页面如果只是一个课程 iframe 容器，不再额外创建自己的面板，
+        // 由 iframe 内实际课程页持有面板，避免一左一右两个 Notes Helper。
+        return !hasEmbeddedCourseFrame();
+    }
+
     function isTaskSubmissionPage() {
         const url = window.location.href;
         if (
@@ -317,6 +338,11 @@
     `);
 
     function createPanel(force = false) {
+        if (!shouldOwnPanel()) {
+            panelCreated = false;
+            return null;
+        }
+
         const activePanel = reconcilePanels();
         if (activePanel) {
             console.log("[AI助手 Pro] 面板已存在，复用当前面板");
@@ -611,6 +637,11 @@
     }
 
     function updateButtonState() {
+        if (!shouldOwnPanel()) {
+            panelCreated = false;
+            return;
+        }
+
         const status = document.getElementById("sjtu-ai-status");
         updateActionAvailability();
         if (status) {
@@ -1391,6 +1422,11 @@
 
     // 页面加载时立即尝试恢复任务
     setTimeout(() => {
+        if (!shouldOwnPanel()) {
+            console.log("[AI助手 Pro] 当前顶层页面仅承载课程 iframe，跳过自身面板创建");
+            return;
+        }
+
         createPanel(true);
         restoreTasksFromServer();
         updateButtonState();
