@@ -2,6 +2,7 @@ import os
 import time
 import subprocess
 import logging
+import json
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -9,6 +10,7 @@ import re
 import uuid
 import shutil
 from pathlib import Path
+import requests
 
 # 导入通用工具模块（自动加载 .env）
 from utils import (
@@ -69,28 +71,43 @@ GEMINI_QUOTA_ERROR_PATTERNS = (
 
 
 def format_gemini_error(error) -> str:
+    return format_ai_error("google", error)
+
+
+def normalize_ai_provider(value: str) -> str:
+    normalized = (value or "google").strip().lower()
+    if normalized in {"openai", "openai-compatible", "openai_compatible"}:
+        return "openai"
+    if normalized in {"google", "gemini"}:
+        return "google"
+    return normalized or "google"
+
+
+def format_ai_error(provider: str, error) -> str:
     raw_text = str(error).strip() or "未知错误"
     normalized = raw_text.lower()
+    label = "OpenAI 兼容接口" if provider == "openai" else "Gemini"
+    api_key_name = "OPENAI_API_KEY" if provider == "openai" else "GOOGLE_API_KEY"
 
     if any(pattern in normalized for pattern in GEMINI_NETWORK_ERROR_PATTERNS):
         return (
-            "Gemini 网络连接失败（不是下载失败）。请检查本机到 Google API 的网络、"
+            f"{label} 网络连接失败（不是下载失败）。请检查本机到模型 API 的网络、"
             f"代理或 DNS 后重试。原始错误: {raw_text}"
         )
 
     if any(pattern in normalized for pattern in GEMINI_AUTH_ERROR_PATTERNS):
         return (
-            "Gemini 鉴权失败。请检查 GOOGLE_API_KEY 是否有效、账号是否有权限访问当前模型。"
+            f"{label} 鉴权失败。请检查 {api_key_name} 是否有效、账号是否有权限访问当前模型。"
             f"原始错误: {raw_text}"
         )
 
     if any(pattern in normalized for pattern in GEMINI_QUOTA_ERROR_PATTERNS):
         return (
-            "Gemini 配额或速率限制触发。请稍后重试，或检查账号配额与模型调用限制。"
+            f"{label} 配额或速率限制触发。请稍后重试，或检查账号配额与模型调用限制。"
             f"原始错误: {raw_text}"
         )
 
-    return f"Gemini 生成失败: {raw_text}"
+    return f"{label} 生成失败: {raw_text}"
 
 # ================= 通用学术笔记 Prompt (适配音频输入) =================
 SYSTEM_PROMPT = """
@@ -996,15 +1013,38 @@ def cleanup_tmp_files(directory: str, extensions: list = None) -> int:
 
 class CoreProcessor:
     def __init__(self):
-        genai.configure(api_key=GOOGLE_API_KEY)
-        self.model = genai.GenerativeModel(
-            "gemini-3-pro-preview",
-            system_instruction="你是一位专业的多模态学术助教，严格按照用户指定的 Markdown 结构输出，突出逻辑与核心概念。"
-        )
-        logger.info("已强制使用 google.generativeai + Gemini 3 Pro")
+        self.ai_provider = normalize_ai_provider(get_config("AI_PROVIDER", "google"))
+        self.model = None
+        self.openai_api_key = get_config("OPENAI_API_KEY", "")
+        self.openai_base_url = get_config(
+            "OPENAI_BASE_URL", "https://api.openai.com/v1"
+        ).rstrip("/")
+        self.openai_model = get_config("OPENAI_MODEL", "gpt-4o-mini")
+        self.openai_max_retries = int(get_config("OPENAI_MAX_RETRIES", 3))
+        self.openai_disable_proxy = get_config(
+            "OPENAI_DISABLE_PROXY", "1"
+        ) not in {"0", "false", "False"}
+        self.openai_timeout = int(get_config("OPENAI_TIMEOUT", 360))
+
+        if self.ai_provider == "openai":
+            logger.info(
+                "已启用 OpenAI 兼容模式: model=%s base_url=%s",
+                self.openai_model,
+                self.openai_base_url,
+            )
+        else:
+            genai.configure(api_key=GOOGLE_API_KEY)
+            self.model = genai.GenerativeModel(
+                "gemini-3-pro-preview",
+                system_instruction="你是一位专业的多模态学术助教，严格按照用户指定的 Markdown 结构输出，突出逻辑与核心概念。"
+            )
+            logger.info("已启用 Google Gemini 模式: model=gemini-3-pro-preview")
         
         # 启动时清理残留的临时文件
         self._cleanup_residual_tmp_files()
+
+    def format_model_error(self, error) -> str:
+        return format_ai_error(self.ai_provider, error)
 
     def _cleanup_residual_tmp_files(self):
         """清理各目录中残留的临时文件"""
@@ -1249,10 +1289,15 @@ class CoreProcessor:
         """
         try:
             if transcript_text:
-                logger.info("使用生成的字幕文本调用 Gemini...")
+                logger.info("使用字幕文本调用 %s...", self.ai_provider)
                 sanitized_text = self._sanitize_transcript(transcript_text)
                 contents = [SYSTEM_PROMPT, sanitized_text]
                 return self._generate_note(contents)
+
+            if self.ai_provider == "openai":
+                raise RuntimeError(
+                    "OpenAI 兼容模式当前仅支持基于字幕文本生成笔记，请先完成转录。"
+                )
 
             logger.info("使用音频文件调用 Gemini 3 Pro...")
             os.makedirs(TEMP_DIR, exist_ok=True)
@@ -1289,7 +1334,7 @@ class CoreProcessor:
         """
         使用 Gemini 处理纯文本字幕（独立 API 使用）
         """
-        logger.info("使用字幕文本调用 Gemini...")
+        logger.info("使用字幕文本调用 %s...", self.ai_provider)
         sanitized_text = self._sanitize_transcript(transcript_text)
         contents = [SYSTEM_PROMPT, sanitized_text]
         return self._generate_note(contents)
@@ -1320,15 +1365,9 @@ class CoreProcessor:
         
         # 第一次调用：生成主体内容
         logger.info("📝 开始第一次生成...")
-        response1 = self.model.generate_content(
-            contents,
-            generation_config=genai.GenerationConfig(
-                temperature=0.3,
-                max_output_tokens=65536,
-            )
+        first_result = self._clean_model_output(
+            self._generate_text_completion(contents)
         )
-        
-        first_result = self._clean_model_output(response1.text)
         logger.info(f"✅ 第一次生成完成，字符数: {len(first_result)}")
         
         # 检查第一次生成是否已完整（包含最终章节标志）
@@ -1351,16 +1390,10 @@ class CoreProcessor:
             "请继续补充完成剩余部分（尤其是 5.4 学习建议 & 复习策略），直接从断点处继续输出，无需重复已有内容。",
             "如果已全部完成，请回复：「已全部生成完毕」"
         ]
-        
-        response2 = self.model.generate_content(
-            contents + [first_result] + continuation_prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.3,
-                max_output_tokens=65536,
-            )
+
+        second_result = self._clean_model_output(
+            self._generate_text_completion(contents + [first_result] + continuation_prompt)
         )
-        
-        second_result = self._clean_model_output(response2.text)
         logger.info(f"✅ 第二次生成完成，字符数: {len(second_result)}")
         
         # 核心判断逻辑：用 COMPLETION_MARKER 检测是否需要拼接
@@ -1383,6 +1416,84 @@ class CoreProcessor:
         # 情况3：第二次结果很短且不包含完成标记 → 可能是模型表示已完成或无效响应
         logger.info(f"✅ 第二次生成内容较短（{len(second_result)}字符）且无完成标记，无需拼接")
         return first_result
+
+    def _generate_text_completion(self, contents):
+        if self.ai_provider == "openai":
+            return self._generate_with_openai(contents)
+
+        response = self.model.generate_content(
+            contents,
+            generation_config=genai.GenerationConfig(
+                temperature=0.3,
+                max_output_tokens=65536,
+            ),
+        )
+        return response.text
+
+    def _generate_with_openai(self, contents):
+        if not self.openai_api_key:
+            raise RuntimeError(
+                "未配置 OPENAI_API_KEY，但当前 AI_PROVIDER=openai。"
+            )
+
+        serialized_contents = []
+        for item in contents:
+            if isinstance(item, str):
+                serialized_contents.append(item)
+                continue
+            raise RuntimeError(
+                "OpenAI 兼容模式当前仅支持文本输入，请先确保字幕文本已生成。"
+            )
+
+        system_prompt = serialized_contents[0] if serialized_contents else SYSTEM_PROMPT
+        user_prompt = "\n\n".join(serialized_contents[1:] or serialized_contents)
+        payload = {
+            "model": self.openai_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.3,
+        }
+
+        session = requests.Session()
+        if self.openai_disable_proxy:
+            session.trust_env = False
+
+        headers = {
+            "Authorization": f"Bearer {self.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        endpoint = f"{self.openai_base_url}/chat/completions"
+
+        try:
+            for attempt in range(1, self.openai_max_retries + 1):
+                try:
+                    response = session.post(
+                        endpoint,
+                        headers=headers,
+                        json=payload,
+                        timeout=self.openai_timeout,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    message = (data.get("choices") or [{}])[0].get("message") or {}
+                    content = message.get("content", "")
+                    if isinstance(content, list):
+                        content = "".join(
+                            part.get("text", "") for part in content if isinstance(part, dict)
+                        )
+                    if not isinstance(content, str) or not content.strip():
+                        raise RuntimeError(
+                            f"OpenAI 兼容接口返回空内容: {json.dumps(data, ensure_ascii=False)[:500]}"
+                        )
+                    return content
+                except requests.RequestException as exc:
+                    if attempt >= self.openai_max_retries:
+                        raise RuntimeError(str(exc)) from exc
+                    time.sleep(min(4, attempt * 2))
+        finally:
+            session.close()
         
     def _merge_continuations(self, first_part: str, second_part: str) -> str:
         """
@@ -1843,7 +1954,7 @@ class CoreProcessor:
         try:
             note_content = self.process_with_gemini(audio_path, transcript_text=transcript_text)
         except Exception as e:
-            formatted_error = format_gemini_error(e)
+            formatted_error = self.format_model_error(e)
             logger.error(formatted_error)
             report("error", 0, formatted_error)
             return {"success": False, "error": formatted_error}

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -79,6 +80,43 @@ class CoreProcessorDownloadTests(unittest.TestCase):
 
         self.assertTrue(result["video_complete"])
         self.assertEqual(result["video_path"], str(video_path))
+
+    def test_process_with_gemini_text_uses_openai_provider_when_configured(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": "openai note body"}}]
+        }
+
+        session = Mock()
+        session.post.return_value = response
+
+        with patch.dict(
+            os.environ,
+            {
+                "AI_PROVIDER": "openai",
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_BASE_URL": "https://api.example.com/v1",
+                "OPENAI_MODEL": "test-model",
+                "OPENAI_MAX_RETRIES": "1",
+                "OPENAI_DISABLE_PROXY": "1",
+                "OPENAI_TIMEOUT": "12",
+            },
+            clear=False,
+        ), patch.object(
+            core_processor.CoreProcessor,
+            "_cleanup_residual_tmp_files",
+            lambda self: None,
+        ), patch.object(core_processor.requests, "Session", return_value=session):
+            processor = core_processor.CoreProcessor()
+            result = processor.process_with_gemini_text("字幕内容")
+
+        self.assertEqual(processor.ai_provider, "openai")
+        self.assertEqual(result, "openai note body")
+        session.post.assert_called_once()
+        self.assertEqual(
+            session.post.call_args.kwargs["json"]["model"], "test-model"
+        )
 
 
 if __name__ == "__main__":
