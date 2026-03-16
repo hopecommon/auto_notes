@@ -8,6 +8,7 @@
 - 修复前端重复轮询与面板重复创建
 - 调整为后端默认串行执行
 - 非课程视频页继续保留任务面板并从服务端续状态
+- 重复任务允许排队，执行时再按当前文件状态做差量判断
 - 修复仓库基础语法健康与环境管理细节
 
 ## Commands Run
@@ -31,7 +32,7 @@ git rm --cached .env
 
 - `tests/test_server_regressions.py`
   - 任务资源锁 key 与任务去重 key 行为
-  - 相同活动任务复用而非重复入队
+  - 相同任务 identity 允许继续入队，不在入队阶段静默复用
   - 下载任务正确走 `video` 模式并传递覆盖语义
   - `/transcribe` 路由正确转发 `overwriteExisting`
 - `tests/test_core_processor_download.py`
@@ -43,6 +44,7 @@ git rm --cached .env
 
 - 前端面板现在可以在已匹配域名下的非视频页面继续显示任务状态，但只允许在课程视频上下文中新增任务
 - 任务状态以后端 `/tasks` 为准，页面跳转后会重新恢复轮询显示
+- 相同课节的后续任务不会自动改写前面任务语义；它们会在真正开始执行时重新检查文件状态并决定补做或跳过
 
 ## Residual Risk
 

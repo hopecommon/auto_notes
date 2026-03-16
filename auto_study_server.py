@@ -59,16 +59,6 @@ def build_task_identity_key(task_type, course_name="", lesson_title="", file_typ
     return "::".join(identity_parts)
 
 
-def _find_reusable_task_locked(task_identity):
-    for task_id, info in task_status.items():
-        if (
-            info.get("taskIdentity") == task_identity
-            and info.get("status") in ACTIVE_TASK_STATUSES
-        ):
-            return task_id
-    return None
-
-
 def enqueue_managed_task(
     task_type,
     action_label,
@@ -78,12 +68,12 @@ def enqueue_managed_task(
     resource_key=None,
     task_identity=None,
 ):
-    """创建或复用任务，避免同一课节同类任务重复入队。"""
+    """创建任务。
+
+    串行执行下允许同类任务继续排队，真正执行时再依据当前文件状态决定是否跳过/
+    补做剩余步骤，而不是在入队阶段静默复用既有任务。
+    """
     with task_lock:
-        if task_identity:
-            existing_task_id = _find_reusable_task_locked(task_identity)
-            if existing_task_id:
-                return existing_task_id, True
         task_id = str(uuid.uuid4())
         task_status[task_id] = {
             "status": "queued",
@@ -107,7 +97,7 @@ def enqueue_managed_task(
         "taskIdentity": task_identity,
     }
     task_queue.put(task_payload)
-    return task_id, False
+    return task_id
 
 
 def get_resource_lock(resource_key):
@@ -443,7 +433,7 @@ def process_video():
     resource_key = build_task_resource_key("note", course_name, lesson_title)
     task_identity = build_task_identity_key("note", course_name, lesson_title)
 
-    task_id, reused = enqueue_managed_task(
+    task_id = enqueue_managed_task(
         task_type="note",
         action_label=action_label,
         display_title=display_title,
@@ -466,7 +456,7 @@ def process_video():
     return jsonify({
         "status": "success",
         "task_id": task_id,
-        "message": "同类任务已在执行，已复用现有任务" if reused else "任务已加入队列"
+        "message": "任务已加入队列"
     })
 
 @app.route('/download', methods=['POST'])
@@ -487,7 +477,7 @@ def download_local():
     resource_key = build_task_resource_key("download", course_name, lesson_title, file_type)
     task_identity = build_task_identity_key("download", course_name, lesson_title, file_type)
 
-    task_id, reused = enqueue_managed_task(
+    task_id = enqueue_managed_task(
         task_type="download",
         action_label=action_label,
         display_title=display_title,
@@ -512,7 +502,7 @@ def download_local():
     return jsonify({
         "status": "success",
         "task_id": task_id,
-        "message": "同类任务已在执行，已复用现有任务" if reused else "任务已加入队列"
+        "message": "任务已加入队列"
     })
 
 @app.route('/tasks/<task_id>', methods=['GET'])
@@ -649,7 +639,7 @@ def transcribe():
     resource_key = build_task_resource_key("transcribe", course_name, lesson_title)
     task_identity = build_task_identity_key("transcribe", course_name, lesson_title)
 
-    task_id, reused = enqueue_managed_task(
+    task_id = enqueue_managed_task(
         task_type="transcribe",
         action_label=action_label,
         display_title=display_title,
@@ -672,7 +662,7 @@ def transcribe():
     return jsonify({
         "status": "success",
         "task_id": task_id,
-        "message": "同类任务已在执行，已复用现有任务" if reused else "转录任务已加入队列"
+        "message": "转录任务已加入队列"
     })
 
 @app.route('/transcribe-only', methods=['POST'])
@@ -705,7 +695,7 @@ def transcribe_only():
     resource_key = build_task_resource_key("transcribe", course_name, lesson_title)
     task_identity = build_task_identity_key("transcribe", course_name, lesson_title)
 
-    task_id, reused = enqueue_managed_task(
+    task_id = enqueue_managed_task(
         task_type="transcribe",
         action_label=action_label,
         display_title=display_title,
@@ -729,7 +719,7 @@ def transcribe_only():
     return jsonify({
         "status": "success",
         "task_id": task_id,
-        "message": "同类任务已在执行，已复用现有任务" if reused else "转录任务已加入队列"
+        "message": "转录任务已加入队列"
     })
 
 @app.route('/generate-note-only', methods=['POST'])
@@ -790,7 +780,7 @@ def generate_note_only():
     resource_key = build_task_resource_key("generate-note", course_name, lesson_title)
     task_identity = build_task_identity_key("generate-note", course_name, lesson_title)
 
-    task_id, reused = enqueue_managed_task(
+    task_id = enqueue_managed_task(
         task_type="generate-note",
         action_label=action_label,
         display_title=display_title,
@@ -814,7 +804,7 @@ def generate_note_only():
     return jsonify({
         "status": "success",
         "task_id": task_id,
-        "message": "同类任务已在执行，已复用现有任务" if reused else "笔记生成任务已加入队列"
+        "message": "笔记生成任务已加入队列"
     })
 
 @app.route('/ping', methods=['GET'])

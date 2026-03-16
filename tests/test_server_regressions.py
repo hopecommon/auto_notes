@@ -28,7 +28,7 @@ class ServerRegressionTests(unittest.TestCase):
         self.assertEqual(resource_download, resource_transcribe)
         self.assertNotEqual(identity_download, identity_transcribe)
 
-    def test_enqueue_managed_task_reuses_same_active_identity(self):
+    def test_enqueue_managed_task_keeps_same_identity_tasks_queued(self):
         payload = {
             "type": "note",
             "courseName": "Course A",
@@ -38,7 +38,7 @@ class ServerRegressionTests(unittest.TestCase):
         }
 
         with patch.object(server.task_queue, "put") as mocked_put:
-            task_id_1, reused_1 = server.enqueue_managed_task(
+            task_id_1 = server.enqueue_managed_task(
                 task_type="note",
                 action_label="生成 AI 笔记",
                 display_title="Course A · Lesson 1",
@@ -47,7 +47,7 @@ class ServerRegressionTests(unittest.TestCase):
                 resource_key=payload["resourceKey"],
                 task_identity=payload["taskIdentity"],
             )
-            task_id_2, reused_2 = server.enqueue_managed_task(
+            task_id_2 = server.enqueue_managed_task(
                 task_type="note",
                 action_label="生成 AI 笔记",
                 display_title="Course A · Lesson 1",
@@ -57,12 +57,13 @@ class ServerRegressionTests(unittest.TestCase):
                 task_identity=payload["taskIdentity"],
             )
 
-        self.assertFalse(reused_1)
-        self.assertTrue(reused_2)
-        self.assertEqual(task_id_1, task_id_2)
-        self.assertEqual(mocked_put.call_count, 1)
+        self.assertNotEqual(task_id_1, task_id_2)
+        self.assertEqual(mocked_put.call_count, 2)
         self.assertEqual(
             server.task_status[task_id_1]["taskIdentity"], payload["taskIdentity"]
+        )
+        self.assertEqual(
+            server.task_status[task_id_2]["taskIdentity"], payload["taskIdentity"]
         )
 
     def test_process_task_download_uses_video_mode_and_overwrite_flag(self):
