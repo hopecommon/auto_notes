@@ -91,10 +91,28 @@
         );
     }
 
+    function isTopLevelLtiHostPage() {
+        if (window.self !== window.top) {
+            return false;
+        }
+
+        const href = window.location.href;
+        const isExternalToolPage =
+            /^https:\/\/oc\.sjtu\.edu\.cn\/courses\/\d+\/external_tools\/\d+/.test(
+                href
+            );
+        const hasCanvasHostMarkers =
+            document.body?.classList.contains("ic-framed-lti-tool") ||
+            Boolean(document.getElementById("tool_content")) ||
+            Boolean(document.querySelector(".tool_content_wrapper"));
+
+        return isExternalToolPage || hasCanvasHostMarkers;
+    }
+
     function shouldOwnPanel() {
         // 顶层页面如果只是一个课程 iframe 容器，不再额外创建自己的面板，
         // 由 iframe 内实际课程页持有面板，避免一左一右两个 Notes Helper。
-        return !hasEmbeddedCourseFrame();
+        return !isTopLevelLtiHostPage() && !hasEmbeddedCourseFrame();
     }
 
     function isTaskSubmissionPage() {
