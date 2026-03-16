@@ -3,6 +3,7 @@ from queue import Queue
 from unittest.mock import Mock, patch
 
 import auto_study_server as server
+from core_processor import format_gemini_error
 
 
 class ServerRegressionTests(unittest.TestCase):
@@ -124,6 +125,14 @@ class ServerRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         queued_task = mocked_put.call_args.args[0]
         self.assertTrue(queued_task["overwriteExisting"])
+
+    def test_format_gemini_error_marks_network_failures_clearly(self):
+        message = format_gemini_error(
+            "Timeout of 600.0s exceeded, last exception: 503 failed to connect to all addresses; last error: UNKNOWN: ipv4:142.250.77.10:443: socket is null"
+        )
+
+        self.assertIn("Gemini 网络连接失败", message)
+        self.assertIn("不是下载失败", message)
 
 
 if __name__ == "__main__":

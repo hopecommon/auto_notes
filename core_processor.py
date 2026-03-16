@@ -42,6 +42,56 @@ FFMPEG_RW_TIMEOUT_US = int(get_config("FFMPEG_RW_TIMEOUT_US", 120_000_000))  # 1
 FFMPEG_MAX_RETRIES = int(get_config("FFMPEG_MAX_RETRIES", 4))
 DISABLE_PROXY_FOR_FFMPEG = get_config("DISABLE_PROXY_FOR_FFMPEG", "1") not in {"0", "false", "False"}
 
+GEMINI_NETWORK_ERROR_PATTERNS = (
+    "timeout of",
+    "deadline exceeded",
+    "failed to connect to all addresses",
+    "socket is null",
+    "connection reset",
+)
+
+GEMINI_AUTH_ERROR_PATTERNS = (
+    "api key not valid",
+    "permission denied",
+    "permission_denied",
+    "unauthenticated",
+    "authentication",
+    "forbidden",
+)
+
+GEMINI_QUOTA_ERROR_PATTERNS = (
+    "quota",
+    "resource exhausted",
+    "resource_exhausted",
+    "rate limit",
+    "too many requests",
+)
+
+
+def format_gemini_error(error) -> str:
+    raw_text = str(error).strip() or "未知错误"
+    normalized = raw_text.lower()
+
+    if any(pattern in normalized for pattern in GEMINI_NETWORK_ERROR_PATTERNS):
+        return (
+            "Gemini 网络连接失败（不是下载失败）。请检查本机到 Google API 的网络、"
+            f"代理或 DNS 后重试。原始错误: {raw_text}"
+        )
+
+    if any(pattern in normalized for pattern in GEMINI_AUTH_ERROR_PATTERNS):
+        return (
+            "Gemini 鉴权失败。请检查 GOOGLE_API_KEY 是否有效、账号是否有权限访问当前模型。"
+            f"原始错误: {raw_text}"
+        )
+
+    if any(pattern in normalized for pattern in GEMINI_QUOTA_ERROR_PATTERNS):
+        return (
+            "Gemini 配额或速率限制触发。请稍后重试，或检查账号配额与模型调用限制。"
+            f"原始错误: {raw_text}"
+        )
+
+    return f"Gemini 生成失败: {raw_text}"
+
 # ================= 通用学术笔记 Prompt (适配音频输入) =================
 SYSTEM_PROMPT = """
 你是一位顶尖的AI学术助教，擅长将技术讲座的文字转录转化为**深度详尽、逻辑严密、重难点突出**的多层次学习材料。你的核心使命是：
@@ -1793,9 +1843,10 @@ class CoreProcessor:
         try:
             note_content = self.process_with_gemini(audio_path, transcript_text=transcript_text)
         except Exception as e:
-            logger.error(f"Gemini 生成失败: {e}")
-            report("error", 0, f"Gemini 生成失败: {e}")
-            return {"success": False, "error": str(e)}
+            formatted_error = format_gemini_error(e)
+            logger.error(formatted_error)
+            report("error", 0, formatted_error)
+            return {"success": False, "error": formatted_error}
         
         if should_cancel():
             return {"success": False, "cancelled": True}

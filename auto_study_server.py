@@ -11,7 +11,7 @@ from queue import Queue
 from pathlib import Path
 
 # 引入核心模块
-from core_processor import CoreProcessor
+from core_processor import CoreProcessor, format_gemini_error
 from stream_selector import select_best_stream
 
 app = Flask(__name__)
@@ -309,7 +309,7 @@ def process_task(task, processor):
         try:
             note_content = processor.process_with_gemini_text(transcript_text)
         except Exception as e:
-            update_task(task_id, "error", 0, f"Gemini 生成失败: {e}")
+            update_task(task_id, "error", 0, format_gemini_error(e))
             return
 
         if should_cancel():
