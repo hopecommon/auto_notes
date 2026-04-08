@@ -60,6 +60,7 @@
         proxyRetryCooldownMs: 5000,
         proxyFailureBackoffMs: 30000,
         secondaryProbeEveryTicks: 4,
+        proxySyncThresholdSec: 0.35,
         debugPreviewIntervalMs: 1200,
         maxSessions: 40,
         autoRecover: true,
@@ -309,7 +310,7 @@
 
         async function initDetector() {
             if (!("BarcodeDetector" in window)) {
-                setStatus("BarcodeDetector unavailable in this browser.", "error");
+                setStatus("BarcodeDetector unavailable in this browser. Chrome/Edge is recommended.", "error");
                 return;
             }
             try {
@@ -445,6 +446,7 @@
                 const probeCandidates = pickProbeCandidates(videos);
                 for (const candidate of probeCandidates) {
                     const { video, idx } = candidate;
+                    primeReadableProxy(video);
                     if (!hasVideoDimensions(video)) {
                         continue;
                     }
@@ -541,6 +543,34 @@
             return result;
         }
 
+        function primeReadableProxy(video) {
+            const src = getVideoSourceUrl(video);
+            if (!src || src.startsWith("blob:")) {
+                return;
+            }
+            const proxy = ensureCorsProxyVideo(src);
+            if (!proxy) {
+                return;
+            }
+
+            if (proxy.readyState >= HTMLMediaElement.HAVE_METADATA) {
+                try {
+                    const sourceTime = Number(video.currentTime || 0);
+                    if (!Number.isNaN(sourceTime) && Math.abs((proxy.currentTime || 0) - sourceTime) > CONFIG.proxySyncThresholdSec) {
+                        proxy.currentTime = sourceTime;
+                    }
+                } catch {
+                    // Ignore currentTime sync failures.
+                }
+            }
+
+            if (!video.paused && proxy.paused) {
+                proxy.play().catch(() => {
+                    // Ignore autoplay failures.
+                });
+            }
+        }
+
         function getPlaybackContextSignature() {
             const activeItem = document.querySelector(".lti-list .list-item--active");
             const activeId =
@@ -574,6 +604,8 @@
             state.health.noFrameSince = 0;
             state.health.noVideoSince = 0;
             state.sourceCanvasAccess.clear();
+            state.proxyFailUntil.clear();
+            state.corsProxyTried.clear();
             state.lastHeavyDecodeAt = 0;
             state.lastFrameSignature = "";
             state.lastFrameAt = 0;
@@ -653,7 +685,7 @@
             state.noScanHintAt = now;
             if (state.crossOriginBlockedHinted && !state.detector) {
                 setStatus(
-                    `No scan: VOD cross-origin + no BarcodeDetector (candidates=${state.lastCandidateCount}).`,
+                    `No scan: VOD cross-origin + no BarcodeDetector (candidates=${state.lastCandidateCount}). Use latest Chrome/Edge, or readable proxy/CORS is required.`,
                     "error"
                 );
                 return;
@@ -1055,6 +1087,11 @@
             proxy.style.display = "none";
             proxy.src = src;
             document.body.appendChild(proxy);
+            try {
+                proxy.load();
+            } catch {
+                // Ignore load failures.
+            }
             proxy.play().catch(() => {
                 // Autoplay can fail silently; frame may still load.
             });
