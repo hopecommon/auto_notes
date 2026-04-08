@@ -189,6 +189,12 @@
             crossOriginBlockedHinted: false,
             noScanHintAt: 0,
             noScanSince: 0,
+            detectorInfo: {
+                available: false,
+                qrSupported: false,
+                formats: [],
+                initError: "",
+            },
             collapsed: true,
             sourceMode: "both",
             playbackSignature: "",
@@ -309,20 +315,42 @@
         }
 
         async function initDetector() {
+            state.detectorInfo = {
+                available: false,
+                qrSupported: false,
+                formats: [],
+                initError: "",
+            };
             if (!("BarcodeDetector" in window)) {
-                setStatus("BarcodeDetector unavailable in this browser. Chrome/Edge is recommended.", "error");
+                state.detectorInfo.initError = "BarcodeDetector missing";
+                pushDebugEvent(`detector unavailable on ${getBrowserRuntimeLabel()}`);
+                setStatus(
+                    "BarcodeDetector unavailable in this runtime. Desktop Windows Chrome may still lack qr_code support.",
+                    "error"
+                );
                 return;
             }
             try {
                 const supportedFormats = await window.BarcodeDetector.getSupportedFormats();
+                state.detectorInfo.available = true;
+                state.detectorInfo.formats = Array.isArray(supportedFormats) ? supportedFormats.slice() : [];
                 if (supportedFormats.includes("qr_code")) {
                     state.detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+                    state.detectorInfo.qrSupported = true;
+                    pushDebugEvent("detector ready: qr_code supported");
                 } else {
-                    setStatus("BarcodeDetector exists but qr_code format is unsupported.", "error");
+                    state.detectorInfo.initError = "qr_code unsupported";
+                    pushDebugEvent(`detector formats=${state.detectorInfo.formats.join(",") || "(none)"}`);
+                    setStatus(
+                        "BarcodeDetector exists, but qr_code is unsupported on this platform/runtime.",
+                        "error"
+                    );
                 }
             } catch (error) {
                 console.warn("[qr-auto-score] BarcodeDetector unavailable:", error);
-                setStatus("BarcodeDetector init failed.", "error");
+                state.detectorInfo.initError = String(error && error.message ? error.message : error || "init failed");
+                pushDebugEvent(`detector init failed: ${safeShort(state.detectorInfo.initError, 80)}`);
+                setStatus("BarcodeDetector init failed. This runtime may block qr_code detection.", "error");
             }
         }
 
@@ -685,7 +713,7 @@
             state.noScanHintAt = now;
             if (state.crossOriginBlockedHinted && !state.detector) {
                 setStatus(
-                    `No scan: VOD cross-origin + no BarcodeDetector (candidates=${state.lastCandidateCount}). Use latest Chrome/Edge, or readable proxy/CORS is required.`,
+                    `No scan: VOD cross-origin + no qr_code detector (candidates=${state.lastCandidateCount}). Desktop Windows Chrome may still fail here; readable proxy/CORS is required.`,
                     "error"
                 );
                 return;
@@ -1573,6 +1601,8 @@
                     ? state.lastCandidateSnapshot
                     : ["(no candidates)"];
                 const lines = [
+                    `runtime=${getBrowserRuntimeLabel()}`,
+                    `detector=${getDetectorSummary()}`,
                     `mode=${state.sourceMode} candidates=${state.lastCandidateCount}`,
                     `active=${state.lastScanSourceLabel || "-"}`,
                     "candidate list:",
@@ -1609,6 +1639,40 @@
             `;
         })
                 .join("");
+        }
+
+        function getBrowserRuntimeLabel() {
+            const uaData = navigator.userAgentData;
+            const brandList = Array.isArray(uaData?.brands)
+                ? uaData.brands
+                    .map((item) => `${item.brand || "?"}/${item.version || "?"}`)
+                    .join(",")
+                : "";
+            const platform =
+                uaData?.platform ||
+                navigator.platform ||
+                navigator.userAgent ||
+                "unknown-platform";
+            const secure = window.isSecureContext ? "secure" : "insecure";
+            return `${platform}; ${secure}${brandList ? `; ${brandList}` : ""}`;
+        }
+
+        function getDetectorSummary() {
+            const info = state.detectorInfo || {};
+            if (state.detector) {
+                return "qr_code ready";
+            }
+            if (!info.available) {
+                return info.initError || "missing";
+            }
+            if (!info.qrSupported) {
+                const formats = Array.isArray(info.formats) && info.formats.length ? info.formats.join(",") : "(none)";
+                return `no-qr_code formats=${formats}`;
+            }
+            if (info.initError) {
+                return `init-failed ${info.initError}`;
+            }
+            return "not-ready";
         }
 
         return {
