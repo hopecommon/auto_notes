@@ -300,7 +300,7 @@ def process_task(task, processor):
             update_task(task_id, "error", 0, f"读取字幕失败: {e}")
             return
 
-        update_task(task_id, "processing", 30, "Gemini 生成笔记中...")
+        update_task(task_id, "processing", 30, "AI 生成笔记中...")
 
         if should_cancel():
             update_task(task_id, "cancelled", 0, "任务已取消")
@@ -825,5 +825,5 @@ if __name__ == '__main__':
         thread.start()
         worker_threads.append(thread)
     
-    print(f"服务已启动 (重构版)，正在监听 5000 端口...")
+    print(f"服务已启动，正在监听 5000 端口...")
     app.run(port=5000)

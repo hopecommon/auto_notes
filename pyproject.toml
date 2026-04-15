@@ -8,10 +8,28 @@ dependencies = [
     "flask",
     "flask-cors",
     "requests",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+ai-google = [
     "google-generativeai",
     "google-genai",
-    "ffmpeg-python",
-    "playwright",
+]
+asr-faster-whisper = [
     "faster-whisper",
-    "python-dotenv",
+]
+asr-funasr = [
+    "funasr",
+    "modelscope",
+    "torch",
+    "torchaudio",
+]
+asr-sherpa-onnx = [
+    "numpy",
+    "sherpa-onnx",
+    "sherpa-onnx-bin",
+]
+browser-playwright = [
+    "playwright",
 ]

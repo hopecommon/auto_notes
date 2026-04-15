@@ -1751,7 +1751,7 @@ class CoreProcessor:
                 output_dir=DOWNLOAD_DIR,
                 language="auto",
             )
-            subtitle_path = transcript_data.get("srt_path")
+            subtitle_path = transcript_data.get("srt_path") or transcript_data.get("txt_path")
             transcript_path = transcript_data.get("txt_path")
             transcript_text = transcript_data.get("text")
             
@@ -1847,7 +1847,7 @@ class CoreProcessor:
                 output_dir=DOWNLOAD_DIR,
                 language="auto",
             )
-            subtitle_path = transcript_data.get("srt_path")
+            subtitle_path = transcript_data.get("srt_path") or transcript_data.get("txt_path")
             transcript_path = transcript_data.get("txt_path")
             transcript_text = transcript_data.get("text")
             
@@ -1947,7 +1947,7 @@ class CoreProcessor:
             return {"success": False, "cancelled": True}
         
         # 2. 调用 Gemini 生成笔记
-        report("processing", 60, "Gemini 生成笔记中...")
+        report("processing", 60, "AI 生成笔记中...")
         if should_cancel():
             return {"success": False, "cancelled": True}
         
