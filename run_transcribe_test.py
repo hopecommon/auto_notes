@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from transcriber import transcribe_audio
 
-# load environment variables from .env so FASTWHISPER_LOCAL_DIR is picked up
+# Load environment variables from .env for local developer overrides.
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
 

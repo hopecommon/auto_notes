@@ -12,7 +12,7 @@
 
 - 检测 SJTU 课程播放页中的视频流
 - 下载音频或视频
-- 使用 `faster-whisper` 生成 `srt` 和 `txt`
+- 使用 `funasr`、`faster-whisper` 或 `sherpa-onnx` 生成字幕文本
 - 使用 OpenAI 兼容接口或 Google Gemini 基于字幕生成 Markdown 笔记
 - 在浏览器面板中查看、取消、恢复任务
 
@@ -21,7 +21,7 @@
 - `sjtu_video_helper.js`: Tampermonkey userscript，负责页面检测、任务提交与状态显示
 - `auto_study_server.py`: 本地 Flask 服务，负责任务排队、调度和状态持久化
 - `core_processor.py`: 下载、转录、笔记生成核心流程
-- `transcriber.py`: `faster-whisper` 封装
+- `transcriber.py`: ASR 封装，支持 `funasr` / `faster-whisper` / `sherpa-onnx`
 
 ## 快速开始
 
@@ -30,6 +30,16 @@
 ```bash
 uv sync
 ```
+
+默认只安装核心依赖。按需追加：
+
+- faster-whisper 默认后端：`uv sync --extra asr-faster-whisper`
+- FunASR 备选后端：`uv sync --extra asr-funasr`
+- sherpa-onnx：`uv sync --extra asr-sherpa-onnx`
+- Google Gemini SDK：`uv sync --extra ai-google`
+- 本地浏览器自动化：`uv sync --extra browser-playwright`
+
+如果你继续使用 `requirements.txt`，它现在只表示最小核心依赖。后端相关依赖以 `pyproject.toml` 里的 extras 为准。
 
 ### 2. 配置环境变量
 
@@ -59,7 +69,17 @@ cp env.example .env
 - `DOWNLOAD_DIR`
 - `OBSIDIAN_VAULT_PATH`
 - `TEMP_DIR`
+- `FUNASR_MODEL_DIR`
+- `FUNASR_VAD_DIR`
+- `FUNASR_PUNC_DIR`
+- `FUNASR_HOTWORD_FILE`
+- `FUNASR_HOTWORD_DIR`
+- `TRANSCRIPT_TERM_MAP_DIR`
+- `ASR_PREPROCESS_AUDIO`
+- `ASR_PREPROCESS_FILTERS`
 - `FASTWHISPER_LOCAL_DIR`
+- `SHERPA_ONNX_MODEL_DIR`
+- `SHERPA_ONNX_VAD_MODEL`
 - `SERIAL_TASK_EXECUTION`
 
 默认情况下，项目会将生成文件放在仓库内的：
@@ -110,3 +130,4 @@ node --check sjtu_video_helper.js
 - 不要提交 `.env`、本地模型目录或个人下载内容。
 - 当前默认文档口径以 `AI_PROVIDER=openai` 为主，Google Gemini 作为兼容选项保留。
 - `OPENAI_BASE_URL` 不是固定供应商配置，可按你使用的 OpenAI 兼容服务自行填写。
+- FunASR 分支会优先输出 `SRT + TXT`；只有拿不到时间戳时才回退为纯 `TXT`。

@@ -1,9 +1,4 @@
 flask
 flask-cors
 requests
-google-generativeai
-google-genai
-ffmpeg-python
-playwright
-faster-whisper
 python-dotenv
