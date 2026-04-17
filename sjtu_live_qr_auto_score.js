@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SJTU Live QR Auto Score
 // @namespace    http://tampermonkey.net/
-// @version      0.3.0
+// @version      0.3.1
 // @description  Unattended QR detection on playback page + worker tab for auto login/check-in.
 // @author       auto_notes
 // @match        *://*.sjtu.edu.cn/*
@@ -43,6 +43,9 @@
 
     const CONFIG = {
         scanIntervalMs: 220,
+        sameFrameRetryMs: 320,
+        pausedFrameRetryMs: 950,
+        recentPayloadFrameRetryMs: 1800,
         samePayloadIgnoreMs: 1100,
         samePayloadQuietMs: 18000,
         samePayloadInFlightQuietMs: 45000,
@@ -52,13 +55,16 @@
         dispatchRetryMs: 45000,
         dispatchSuccessLockMs: 600000,
         dispatchScanPageLockMs: 120000,
-        maxFrameWidth: 1440,
-        detectorRoiTargetWidth: 1400,
+        maxFrameWidth: 1080,
+        detectorRoiTargetWidth: 1120,
         detectorRoiMaxUpscale: 2.6,
         detectorRoiBatchSize: 2,
-        heavyDecodeIntervalMs: 900,
+        heavyDecodeIntervalMs: 1200,
         proxyRetryCooldownMs: 5000,
         proxyFailureBackoffMs: 30000,
+        proxyDecodeMinIntervalMs: 1800,
+        proxyWarmupWaitMs: 380,
+        proxySeekCooldownMs: 1200,
         secondaryProbeEveryTicks: 4,
         proxySyncThresholdSec: 0.35,
         debugPreviewIntervalMs: 1200,
@@ -77,7 +83,7 @@
         workerHeartbeatMs: 3000,
         workerAliveWindowMs: 15000,
         skipDispatchForMobileScanPage: true,
-        debugPreviewEnabled: true,
+        debugPreviewEnabled: false,
         debugMaxEvents: 12,
         autoStartOnLoad: false,
         loginUsername: "",
@@ -178,8 +184,6 @@
             lastPayload: "",
             lastPayloadAt: 0,
             lastUrl: "",
-            lastFrameSignature: "",
-            lastFrameAt: 0,
             lastHeavyDecodeAt: 0,
             roiCursor: 0,
             probeTick: 0,
@@ -207,11 +211,17 @@
             lastFramePreviewDataUrl: "",
             lastPreviewAt: 0,
             lastCandidateSnapshot: [],
+            frameProbeState: new Map(),
             corsProxyVideos: new Map(),
             corsProxyTried: new Set(),
             proxyFailUntil: new Map(),
+            proxyProbeState: new Map(),
             sourceCanvasAccess: new Map(),
             els: {},
+            lastStatus: {
+                text: "",
+                level: "",
+            },
             health: {
                 noVideoSince: 0,
                 noFrameSince: 0,
@@ -426,6 +436,7 @@
             state.running = false;
             state.els.toggle.textContent = "Start";
             state.scanLocked = false;
+            releaseCorsProxyVideos();
             setStatus("Idle. Click Start when you need QR detection.", "normal");
             renderPanel();
         }
@@ -434,8 +445,6 @@
             state.scanLocked = false;
             state.noScanSince = 0;
             state.noScanHintAt = 0;
-            state.lastFrameSignature = "";
-            state.lastFrameAt = 0;
             state.lastHeavyDecodeAt = 0;
             state.health.noFrameSince = 0;
             state.health.noVideoSince = 0;
@@ -446,6 +455,11 @@
             state.lastCandidateCount = 0;
             state.lastCandidateSnapshot = [];
             state.lastFramePreviewDataUrl = "";
+            state.frameProbeState.clear();
+            state.proxyProbeState.clear();
+            state.sourceCanvasAccess.clear();
+            state.proxyFailUntil.clear();
+            state.corsProxyTried.clear();
         }
 
         async function scanTick() {
@@ -465,6 +479,7 @@
                     return;
                 }
 
+                let hasVideoFrameCandidate = false;
                 let hasReadyFrame = false;
                 let attemptedDecode = false;
                 const activeSession = state.currentSessionId ? state.sessions.get(state.currentSessionId) : null;
@@ -474,22 +489,20 @@
                 const probeCandidates = pickProbeCandidates(videos);
                 for (const candidate of probeCandidates) {
                     const { video, idx } = candidate;
-                    primeReadableProxy(video);
                     if (!hasVideoDimensions(video)) {
                         continue;
                     }
+                    hasVideoFrameCandidate = true;
                     state.lastScanSourceLabel = describeVideoCandidate(video, idx);
+                    if (!isReadyVideoFrame(video)) {
+                        continue;
+                    }
                     hasReadyFrame = true;
                     if (shouldSkipDecodeForStableFrame(video, idx, activeSession)) {
                         continue;
                     }
                     onHealthyFrame(video);
                     attemptedDecode = true;
-                    if (!tryDrawFrame(video)) {
-                        continue;
-                    }
-                    state.lastFrameSignature = buildFrameSignature(video, idx);
-                    state.lastFrameAt = Date.now();
                     const shouldUseHeavy = allowHeavyDecode && !heavyUsedInThisTick && idx === 0;
                     const payload = await decodePayload(video, { fastOnly: !shouldUseHeavy });
                     if (!state.running || currentEpoch !== state.scanEpoch) {
@@ -506,7 +519,7 @@
                     return;
                 }
 
-                if (!hasReadyFrame) {
+                if (!hasVideoFrameCandidate || !hasReadyFrame) {
                     onNoFrame();
                     return;
                 }
@@ -523,24 +536,35 @@
         }
 
         function shouldSkipDecodeForStableFrame(video, idx, session) {
-            if (!state.lastPayload) {
-                return false;
-            }
-            const quietWindow = getSamePayloadQuietWindow(session);
-            if (Date.now() - state.lastPayloadAt >= quietWindow) {
-                return false;
-            }
+            const now = Date.now();
+            const trackerKey = `${getVideoSourceKey(video)}|${idx}`;
+            const tracker = state.frameProbeState.get(trackerKey) || {
+                frameSig: "",
+                lastAttemptAt: 0,
+            };
             const frameSig = buildFrameSignature(video, idx);
-            if (frameSig && frameSig === state.lastFrameSignature && Date.now() - state.lastFrameAt < 2500) {
+            let minRetryMs = 0;
+            if (frameSig && frameSig === tracker.frameSig) {
+                minRetryMs = video.paused ? CONFIG.pausedFrameRetryMs : CONFIG.sameFrameRetryMs;
+                if (state.lastPayload && now - state.lastPayloadAt < getSamePayloadQuietWindow(session)) {
+                    minRetryMs = Math.max(minRetryMs, CONFIG.recentPayloadFrameRetryMs);
+                }
+            }
+            if (minRetryMs > 0 && now - tracker.lastAttemptAt < minRetryMs) {
                 return true;
             }
+            tracker.frameSig = frameSig;
+            tracker.lastAttemptAt = now;
+            state.frameProbeState.set(trackerKey, tracker);
             return false;
         }
 
         function buildFrameSignature(video, idx) {
+            const decodedFrames = getVideoDecodedFrameCount(video);
             const t = Number(video.currentTime || 0).toFixed(2);
             const paused = video.paused ? "p" : "r";
-            return `${idx}|${video.videoWidth}x${video.videoHeight}|${t}|${paused}`;
+            const frameToken = decodedFrames >= 0 ? `f=${decodedFrames}` : `t=${t}`;
+            return `${idx}|${video.videoWidth}x${video.videoHeight}|${frameToken}|${paused}`;
         }
 
         function describeVideoCandidate(video, idx) {
@@ -569,34 +593,6 @@
                 result.push({ video: videos[1], idx: 1 });
             }
             return result;
-        }
-
-        function primeReadableProxy(video) {
-            const src = getVideoSourceUrl(video);
-            if (!src || src.startsWith("blob:")) {
-                return;
-            }
-            const proxy = ensureCorsProxyVideo(src);
-            if (!proxy) {
-                return;
-            }
-
-            if (proxy.readyState >= HTMLMediaElement.HAVE_METADATA) {
-                try {
-                    const sourceTime = Number(video.currentTime || 0);
-                    if (!Number.isNaN(sourceTime) && Math.abs((proxy.currentTime || 0) - sourceTime) > CONFIG.proxySyncThresholdSec) {
-                        proxy.currentTime = sourceTime;
-                    }
-                } catch {
-                    // Ignore currentTime sync failures.
-                }
-            }
-
-            if (!video.paused && proxy.paused) {
-                proxy.play().catch(() => {
-                    // Ignore autoplay failures.
-                });
-            }
         }
 
         function getPlaybackContextSignature() {
@@ -633,10 +629,9 @@
             state.health.noVideoSince = 0;
             state.sourceCanvasAccess.clear();
             state.proxyFailUntil.clear();
-            state.corsProxyTried.clear();
+            state.frameProbeState.clear();
             state.lastHeavyDecodeAt = 0;
-            state.lastFrameSignature = "";
-            state.lastFrameAt = 0;
+            releaseCorsProxyVideos();
         }
 
         function onNoVideo() {
@@ -664,39 +659,11 @@
         }
 
         function nudgeVideoPipeline(now) {
-            if (now - state.health.lastNudgeAt < 5000) {
+            if (now - state.health.lastNudgeAt < 12000) {
                 return;
             }
             state.health.lastNudgeAt = now;
-            const candidates = resolveCandidateVideos();
-            candidates.forEach((video) => {
-                try {
-                    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA && Number(video.currentTime || 0) >= 0) {
-                        video.currentTime = Number(video.currentTime || 0);
-                    }
-                    if (video.paused && Number(video.currentTime || 0) === 0) {
-                        const maybePromise = video.play();
-                        if (maybePromise && typeof maybePromise.then === "function") {
-                            maybePromise
-                                .then(() => {
-                                    window.setTimeout(() => {
-                                        try {
-                                            video.pause();
-                                        } catch {
-                                            // Ignore pause errors.
-                                        }
-                                    }, 180);
-                                })
-                                .catch(() => {
-                                    // Ignore autoplay rejection.
-                                });
-                        }
-                    }
-                } catch {
-                    // Ignore nudge errors.
-                }
-            });
-            pushDebugEvent("nudge video pipeline");
+            pushDebugEvent("frame not ready, keep waiting");
         }
 
         function onNoQrDetected() {
@@ -863,18 +830,8 @@
                 state.thresholdCanvas.height = height;
             }
             state.ctx.drawImage(video, 0, 0, width, height);
-            if (state.debugEnabled) {
+            if (state.debugEnabled && !state.collapsed) {
                 updateDebugPreviewDataUrl();
-            }
-        }
-
-        function tryDrawFrame(video) {
-            try {
-                drawFrame(video);
-                return true;
-            } catch {
-                pushDebugEvent("draw frame failed");
-                return false;
             }
         }
 
@@ -918,6 +875,9 @@
                 }
             }
 
+            if (!shouldAttemptProxyDecode(srcKey)) {
+                return "";
+            }
             pushDebugEvent("canvas tainted, trying proxy decode");
             const fromProxy = await tryDecodeFromCorsProxy(video);
             if (fromProxy) {
@@ -1022,7 +982,7 @@
                 state.thresholdCanvas.height = outH;
             }
             state.ctx.drawImage(video, sx, sy, sw, sh, 0, 0, outW, outH);
-            if (state.debugEnabled) {
+            if (state.debugEnabled && !state.collapsed) {
                 updateDebugPreviewDataUrl();
             }
         }
@@ -1059,20 +1019,13 @@
                 state.proxyFailUntil.set(src, now + CONFIG.proxyRetryCooldownMs);
                 return "";
             }
-            if (proxy.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !proxy.videoWidth || !proxy.videoHeight) {
+            const tracker = getProxyProbeState(src);
+            if (!prepareProxyFrame(proxy, video, src, tracker, now)) {
                 return "";
             }
 
-            // Best effort: keep proxy frame close to source frame.
             try {
-                if (!Number.isNaN(video.currentTime) && video.currentTime > 0 && Math.abs(proxy.currentTime - video.currentTime) > 1.2) {
-                    proxy.currentTime = video.currentTime;
-                }
-            } catch {
-                // Ignore seek failure.
-            }
-
-            try {
+                tracker.lastDecodeAt = now;
                 drawFrame(proxy);
                 const imageData = state.ctx.getImageData(0, 0, state.canvas.width, state.canvas.height);
                 const direct = window.jsQR(imageData.data, imageData.width, imageData.height, {
@@ -1120,11 +1073,70 @@
             } catch {
                 // Ignore load failures.
             }
-            proxy.play().catch(() => {
-                // Autoplay can fail silently; frame may still load.
-            });
             state.corsProxyVideos.set(src, proxy);
             return proxy;
+        }
+
+        function shouldAttemptProxyDecode(srcKey) {
+            if (!srcKey) {
+                return false;
+            }
+            const tracker = getProxyProbeState(srcKey);
+            return Date.now() - tracker.lastDecodeAt >= CONFIG.proxyDecodeMinIntervalMs;
+        }
+
+        function getProxyProbeState(src) {
+            const existing = state.proxyProbeState.get(src);
+            if (existing) {
+                return existing;
+            }
+            const created = {
+                lastDecodeAt: 0,
+                lastSeekAt: 0,
+            };
+            state.proxyProbeState.set(src, created);
+            return created;
+        }
+
+        function prepareProxyFrame(proxy, video, src, tracker, now) {
+            if (!proxy || !tracker) {
+                return false;
+            }
+            if (proxy.readyState < HTMLMediaElement.HAVE_METADATA) {
+                state.proxyFailUntil.set(src, now + 600);
+                return false;
+            }
+
+            const sourceTime = Number(video.currentTime || 0);
+            const canSeekProxy = Number.isFinite(proxy.duration) && proxy.duration > 0;
+            if (
+                canSeekProxy &&
+                Number.isFinite(sourceTime) &&
+                sourceTime > 0 &&
+                Math.abs((proxy.currentTime || 0) - sourceTime) > CONFIG.proxySyncThresholdSec
+            ) {
+                if (now - tracker.lastSeekAt < CONFIG.proxySeekCooldownMs) {
+                    return false;
+                }
+                try {
+                    proxy.currentTime = sourceTime;
+                    tracker.lastSeekAt = now;
+                    state.proxyFailUntil.set(src, now + CONFIG.proxyWarmupWaitMs);
+                    pushDebugEvent("proxy seek sync");
+                } catch {
+                    state.proxyFailUntil.set(src, now + CONFIG.proxyRetryCooldownMs);
+                }
+                return false;
+            }
+
+            if (tracker.lastSeekAt && now - tracker.lastSeekAt < CONFIG.proxyWarmupWaitMs) {
+                return false;
+            }
+            if (proxy.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !proxy.videoWidth || !proxy.videoHeight) {
+                state.proxyFailUntil.set(src, now + 450);
+                return false;
+            }
+            return true;
         }
 
         function getVideoSourceUrl(video) {
@@ -1488,6 +1500,11 @@
             if (!state.els.status) {
                 return;
             }
+            if (state.lastStatus.text === text && state.lastStatus.level === level) {
+                return;
+            }
+            state.lastStatus.text = text;
+            state.lastStatus.level = level;
             const color = level === "error" ? "#ffb3b3" : level === "ok" ? "#ccffe4" : "#cfddff";
             state.els.status.style.color = color;
             state.els.status.textContent = text;
@@ -1551,6 +1568,24 @@
                 }
                 state.corsProxyVideos.delete(src);
             });
+        }
+
+        function releaseCorsProxyVideos() {
+            const entries = [...state.corsProxyVideos.entries()];
+            entries.forEach(([src, video]) => {
+                try {
+                    video.pause();
+                    video.removeAttribute("src");
+                    video.load();
+                    video.remove();
+                } catch {
+                    // Ignore cleanup errors.
+                }
+                state.corsProxyVideos.delete(src);
+            });
+            state.corsProxyTried.clear();
+            state.proxyFailUntil.clear();
+            state.proxyProbeState.clear();
         }
 
         function renderPanel() {
@@ -2078,6 +2113,18 @@
                 video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
                 hasVideoDimensions(video)
         );
+    }
+
+    function getVideoDecodedFrameCount(video) {
+        if (!isVideoElement(video) || typeof video.getVideoPlaybackQuality !== "function") {
+            return -1;
+        }
+        try {
+            const quality = video.getVideoPlaybackQuality();
+            return Number.isFinite(quality?.totalVideoFrames) ? quality.totalVideoFrames : -1;
+        } catch {
+            return -1;
+        }
     }
 
     function hasVideoDimensions(video) {
