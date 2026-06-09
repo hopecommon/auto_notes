@@ -101,6 +101,7 @@ class CoreProcessorDownloadTests(unittest.TestCase):
                 "OPENAI_MAX_RETRIES": "1",
                 "OPENAI_DISABLE_PROXY": "1",
                 "OPENAI_TIMEOUT": "12",
+                "OPENAI_STREAM": "0",
             },
             clear=False,
         ), patch.object(
@@ -117,6 +118,48 @@ class CoreProcessorDownloadTests(unittest.TestCase):
         self.assertEqual(
             session.post.call_args.kwargs["json"]["model"], "test-model"
         )
+        self.assertFalse(session.post.call_args.kwargs["stream"])
+
+    def test_process_with_gemini_text_reads_openai_stream_when_enabled(self):
+        response = Mock()
+        response.headers = {}
+        response.raise_for_status.return_value = None
+        response.iter_lines.return_value = [
+            'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"stream "},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"note body"},"finish_reason":null}]}',
+            "data: [DONE]",
+        ]
+
+        session = Mock()
+        session.post.return_value = response
+
+        with patch.dict(
+            os.environ,
+            {
+                "AI_PROVIDER": "openai",
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_BASE_URL": "https://api.example.com/v1",
+                "OPENAI_MODEL": "test-model",
+                "OPENAI_MAX_RETRIES": "1",
+                "OPENAI_DISABLE_PROXY": "1",
+                "OPENAI_TIMEOUT": "12",
+                "OPENAI_STREAM": "1",
+                "OPENAI_STREAM_IDLE_TIMEOUT": "34",
+            },
+            clear=False,
+        ), patch.object(
+            core_processor.CoreProcessor,
+            "_cleanup_residual_tmp_files",
+            lambda self: None,
+        ), patch.object(core_processor.requests, "Session", return_value=session):
+            processor = core_processor.CoreProcessor()
+            result = processor.process_with_gemini_text("字幕内容")
+
+        self.assertEqual(result, "stream note body")
+        self.assertTrue(session.post.call_args.kwargs["json"]["stream"])
+        self.assertTrue(session.post.call_args.kwargs["stream"])
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (12, 34))
 
 
 if __name__ == "__main__":

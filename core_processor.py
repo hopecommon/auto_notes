@@ -1025,6 +1025,14 @@ class CoreProcessor:
             "OPENAI_DISABLE_PROXY", "1"
         ) not in {"0", "false", "False"}
         self.openai_timeout = int(get_config("OPENAI_TIMEOUT", 360))
+        self.openai_stream = get_config("OPENAI_STREAM", "1") not in {
+            "0",
+            "false",
+            "False",
+        }
+        self.openai_stream_idle_timeout = int(
+            get_config("OPENAI_STREAM_IDLE_TIMEOUT", 120)
+        )
 
         if self.ai_provider == "openai":
             logger.info(
@@ -1455,6 +1463,8 @@ class CoreProcessor:
             ],
             "temperature": 0.3,
         }
+        if self.openai_stream:
+            payload["stream"] = True
 
         session = requests.Session()
         if self.openai_disable_proxy:
@@ -1469,24 +1479,45 @@ class CoreProcessor:
         try:
             for attempt in range(1, self.openai_max_retries + 1):
                 try:
+                    request_timeout = self.openai_timeout
+                    if self.openai_stream:
+                        request_timeout = (
+                            min(30, self.openai_timeout),
+                            self.openai_stream_idle_timeout,
+                        )
+                    started_at = time.perf_counter()
+                    logger.info(
+                        "OpenAI 兼容接口请求: attempt=%s/%s stream=%s prompt_chars=%s payload_bytes=%s",
+                        attempt,
+                        self.openai_max_retries,
+                        self.openai_stream,
+                        len(system_prompt) + len(user_prompt),
+                        len(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+                    )
                     response = session.post(
                         endpoint,
                         headers=headers,
                         json=payload,
-                        timeout=self.openai_timeout,
+                        timeout=request_timeout,
+                        stream=self.openai_stream,
+                    )
+                    logger.info(
+                        "OpenAI 兼容接口响应头: status=%s elapsed=%.2fs cf-ray=%s content-type=%s",
+                        response.status_code,
+                        time.perf_counter() - started_at,
+                        response.headers.get("cf-ray"),
+                        response.headers.get("content-type"),
                     )
                     response.raise_for_status()
-                    data = response.json()
-                    message = (data.get("choices") or [{}])[0].get("message") or {}
-                    content = message.get("content", "")
-                    if isinstance(content, list):
-                        content = "".join(
-                            part.get("text", "") for part in content if isinstance(part, dict)
-                        )
-                    if not isinstance(content, str) or not content.strip():
-                        raise RuntimeError(
-                            f"OpenAI 兼容接口返回空内容: {json.dumps(data, ensure_ascii=False)[:500]}"
-                        )
+                    if self.openai_stream:
+                        content = self._read_openai_stream(response)
+                    else:
+                        content = self._read_openai_response(response)
+                    logger.info(
+                        "OpenAI 兼容接口生成完成: elapsed=%.2fs chars=%s",
+                        time.perf_counter() - started_at,
+                        len(content),
+                    )
                     return content
                 except requests.RequestException as exc:
                     if attempt >= self.openai_max_retries:
@@ -1494,6 +1525,55 @@ class CoreProcessor:
                     time.sleep(min(4, attempt * 2))
         finally:
             session.close()
+
+    def _read_openai_response(self, response):
+        data = response.json()
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(
+                f"OpenAI 兼容接口返回空内容: {json.dumps(data, ensure_ascii=False)[:500]}"
+            )
+        return content
+
+    def _read_openai_stream(self, response):
+        chunks = []
+        last_chunk_at = time.monotonic()
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if time.monotonic() - last_chunk_at > self.openai_stream_idle_timeout:
+                raise RuntimeError(
+                    f"OpenAI 兼容接口流式响应超时: {self.openai_stream_idle_timeout}s 内无内容"
+                )
+            if not raw_line:
+                continue
+
+            line = raw_line.strip()
+            if line == "data: [DONE]":
+                break
+            if not line.startswith("data: "):
+                continue
+
+            last_chunk_at = time.monotonic()
+            try:
+                data = json.loads(line[6:])
+            except json.JSONDecodeError:
+                logger.warning("OpenAI 兼容接口流式响应无法解析: %s", line[:300])
+                continue
+
+            choice = (data.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str):
+                chunks.append(content)
+
+        content = "".join(chunks)
+        if not content.strip():
+            raise RuntimeError("OpenAI 兼容接口流式响应返回空内容")
+        return content
         
     def _merge_continuations(self, first_part: str, second_part: str) -> str:
         """
