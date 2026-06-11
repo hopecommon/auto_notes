@@ -1,6 +1,8 @@
 import importlib
 import hashlib
+import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -19,9 +21,14 @@ load_dotenv()
 
 logger = logging.getLogger("Transcriber")
 
+
+def _get_env_stripped(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
+
+
 ASR_ENGINE = os.getenv("ASR_ENGINE", "faster-whisper").lower()
 FAST_WHISPER_MODEL = os.getenv("FASTWHISPER_MODEL", "large-v3")
-FAST_WHISPER_LOCAL_DIR = os.getenv("FASTWHISPER_LOCAL_DIR")
+FAST_WHISPER_LOCAL_DIR = _get_env_stripped("FASTWHISPER_LOCAL_DIR")
 if FAST_WHISPER_LOCAL_DIR:
     logger.info("使用本地 faster-whisper 模型目录: %s", FAST_WHISPER_LOCAL_DIR)
 FAST_WHISPER_DEVICE = os.getenv("FASTWHISPER_DEVICE", "cuda")
@@ -87,6 +94,9 @@ FUNASR_SAVE_RAW = os.getenv("FUNASR_SAVE_RAW", "false").lower() == "true"
 FUNASR_PYTHON = (os.getenv("FUNASR_PYTHON", "") or "").strip()
 TRANSCRIPT_TERM_MAP_DIR = (os.getenv("TRANSCRIPT_TERM_MAP_DIR", "") or "").strip()
 MAX_TRANSCRIPT_CHARS = int(os.getenv("TRANSCRIPT_MAX_CHARS", "200000"))
+SUBTITLE_MAX_CHARS = int(os.getenv("SUBTITLE_MAX_CHARS", "180"))
+SUBTITLE_MAX_SECONDS = float(os.getenv("SUBTITLE_MAX_SECONDS", "30"))
+SUBTITLE_MERGE_MAX_GAP = float(os.getenv("SUBTITLE_MERGE_MAX_GAP", "2.0"))
 ASR_PREPROCESS_AUDIO = os.getenv("ASR_PREPROCESS_AUDIO", "false").lower() == "true"
 ASR_PREPROCESS_FILTERS = (
     os.getenv("ASR_PREPROCESS_FILTERS", "highpass,lowpass,loudnorm,afftdn") or ""
@@ -1239,6 +1249,103 @@ def _segments_to_srt_like_text(segments: Iterable[_SubtitleSegment]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _split_text_for_subtitle(
+    text: str,
+    max_chars: int,
+    min_parts: int = 1,
+) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    break_chars = set("。！？!?；;，,、 ")
+    min_parts = max(1, min(min_parts, len(text)))
+    if min_parts > 1:
+        max_chars = max(1, min(max_chars, len(text) // min_parts))
+
+    parts: List[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        split_at = -1
+        search_start = max(1, int(max_chars * 0.45))
+        for idx in range(max_chars - 1, search_start - 1, -1):
+            if idx < len(remaining) and remaining[idx] in break_chars:
+                split_at = idx + 1
+                break
+        if split_at <= 0:
+            split_at = max_chars
+        part = remaining[:split_at].strip()
+        if part:
+            parts.append(part)
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def _normalize_subtitle_segments(segments: Iterable) -> List[_SubtitleSegment]:
+    split_segments: List[_SubtitleSegment] = []
+    max_chars = max(1, SUBTITLE_MAX_CHARS)
+    max_seconds = max(0.1, SUBTITLE_MAX_SECONDS)
+    merge_max_gap = max(0.0, SUBTITLE_MERGE_MAX_GAP)
+
+    for seg in segments:
+        text = (getattr(seg, "text", "") or "").strip()
+        if not text:
+            continue
+
+        start = float(getattr(seg, "start", 0) or 0)
+        end = float(getattr(seg, "end", start) or start)
+        if end < start:
+            end = start
+
+        duration = max(0.0, end - start)
+        min_parts_by_duration = max(1, math.ceil(duration / max_seconds))
+        parts = _split_text_for_subtitle(text, max_chars, min_parts_by_duration)
+        if not parts:
+            continue
+
+        cursor = start
+        part_duration = min(max_seconds, duration / len(parts)) if duration else 0.001
+        for idx, part in enumerate(parts):
+            if duration <= max_seconds * len(parts) and idx == len(parts) - 1:
+                part_end = end
+            else:
+                part_end = cursor + part_duration
+            if part_end <= cursor:
+                part_end = cursor + 0.001
+            split_segments.append(_SubtitleSegment(start=cursor, end=part_end, text=part))
+            cursor = part_end
+
+    merged: List[_SubtitleSegment] = []
+    current: _SubtitleSegment | None = None
+    for seg in split_segments:
+        if current is None:
+            current = seg
+            continue
+
+        gap = max(0.0, seg.start - current.end)
+        merged_text = _join_text_fragments([current.text, seg.text])
+        merged_duration = seg.end - current.start
+        if (
+            gap <= merge_max_gap
+            and len(merged_text) <= max_chars
+            and merged_duration <= max_seconds
+        ):
+            current = _SubtitleSegment(
+                start=current.start,
+                end=seg.end,
+                text=merged_text,
+            )
+        else:
+            merged.append(current)
+            current = seg
+
+    if current is not None:
+        merged.append(current)
+    return merged
+
+
 def _write_subtitle_outputs(
     audio_path: Path,
     output_dir: Path,
@@ -1253,14 +1360,14 @@ def _write_subtitle_outputs(
         if tmp.exists():
             tmp.unlink()
 
-    normalized_segments = [
+    normalized_segments = _normalize_subtitle_segments(
         _SubtitleSegment(
             start=seg.start,
             end=seg.end,
             text=_apply_course_term_map(audio_path, seg.text or ""),
         )
         for seg in segments
-    ]
+    )
     plain_text = _apply_course_term_map(audio_path, _segments_to_text(normalized_segments))
 
     try:
@@ -1843,9 +1950,11 @@ def _transcribe_with_sherpa_onnx(
         if tmp.exists():
             tmp.unlink()
 
+    normalized_segments = _normalize_subtitle_segments(all_segments)
+
     try:
-        _write_srt(all_segments, srt_tmp)
-        transcript_text = _segments_to_text(all_segments)
+        _write_srt(normalized_segments, srt_tmp)
+        transcript_text = _segments_to_text(normalized_segments)
         if len(transcript_text) > MAX_TRANSCRIPT_CHARS:
             transcript_text = (
                 transcript_text[:MAX_TRANSCRIPT_CHARS]
@@ -1969,7 +2078,7 @@ def _transcribe_with_faster_whisper(
     )
 
     # 批处理加速（batched whisper）
-    use_batched = os.getenv("FASTWHISPER_BATCHED", "true").lower() == "true"
+    use_batched = os.getenv("FASTWHISPER_BATCHED", "false").lower() == "true"
     batch_size = int(os.getenv("FASTWHISPER_BATCH_SIZE", "16"))  # 批大小
 
     logger.info(
@@ -2065,9 +2174,11 @@ def _transcribe_with_faster_whisper(
             tmp.unlink()
             logger.debug(f"清理残留临时文件: {tmp}")
 
+    normalized_segments = _normalize_subtitle_segments(segment_list)
+
     try:
-        _write_srt(segment_list, srt_tmp)
-        transcript_text = _segments_to_text(segment_list)
+        _write_srt(normalized_segments, srt_tmp)
+        transcript_text = _segments_to_text(normalized_segments)
         if len(transcript_text) > MAX_TRANSCRIPT_CHARS:
             transcript_text = (
                 transcript_text[:MAX_TRANSCRIPT_CHARS]
@@ -2141,46 +2252,12 @@ def _join_text_fragments(fragments: List[str]) -> str:
 
 
 def _segments_to_text(segments: Iterable) -> str:
-    paragraphs: List[str] = []
-    current_fragments: List[str] = []
-    current_chars = 0
-    previous_end: float | None = None
-
-    def flush_paragraph() -> None:
-        nonlocal current_fragments, current_chars, previous_end
-        paragraph = _join_text_fragments(current_fragments)
-        if paragraph:
-            paragraphs.append(paragraph)
-        current_fragments = []
-        current_chars = 0
-        previous_end = None
-
+    lines: List[str] = []
     for seg in segments:
+        timestamp = _format_timestamp(getattr(seg, "start", 0))
         text = (seg.text or "").strip()
-        if text:
-            start = getattr(seg, "start", None)
-            end = getattr(seg, "end", None)
-
-            should_break = False
-            if current_fragments:
-                gap = None
-                if previous_end is not None and start is not None:
-                    gap = float(start) - float(previous_end)
-                if gap is not None and gap >= 3.0:
-                    should_break = True
-                elif current_chars >= 220:
-                    should_break = True
-
-            if should_break:
-                flush_paragraph()
-
-            current_fragments.append(text)
-            current_chars += len(text)
-            if end is not None:
-                previous_end = float(end)
-
-    flush_paragraph()
-    return "\n\n".join(paragraphs).strip()
+        lines.append(f"[{timestamp}] {text}")
+    return "\n".join(lines)
 
 
 def _format_timestamp(seconds: float) -> str:

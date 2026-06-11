@@ -81,6 +81,55 @@ class CoreProcessorDownloadTests(unittest.TestCase):
         self.assertTrue(result["video_complete"])
         self.assertEqual(result["video_path"], str(video_path))
 
+    def test_step_transcribe_from_audio_overwrites_existing_subtitle(self):
+        processor = core_processor.CoreProcessor.__new__(core_processor.CoreProcessor)
+        processor.parse_metadata = Mock(return_value="lesson-1")
+
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(download_dir) / "lesson-1.m4a"
+            srt_path = Path(download_dir) / "lesson-1.srt"
+            txt_path = Path(download_dir) / "lesson-1.txt"
+            audio_path.write_bytes(b"audio")
+            srt_path.write_text("old srt", encoding="utf-8")
+            txt_path.write_text("old txt", encoding="utf-8")
+
+            processor.check_existing_files = Mock(
+                return_value={
+                    "subtitle_path": str(txt_path),
+                    "transcript_text": "old txt",
+                }
+            )
+
+            with patch.object(core_processor, "DOWNLOAD_DIR", download_dir), patch.object(
+                core_processor, "TEMP_DIR", temp_dir
+            ), patch.object(core_processor, "transcribe_audio") as mocked_transcribe:
+                def write_new_transcript(*args, **kwargs):
+                    self.assertFalse(srt_path.exists())
+                    self.assertFalse(txt_path.exists())
+                    srt_path.write_text("new srt", encoding="utf-8")
+                    txt_path.write_text("new transcript", encoding="utf-8")
+                    return {
+                        "srt_path": str(srt_path),
+                        "txt_path": str(txt_path),
+                        "text": "new transcript",
+                    }
+
+                mocked_transcribe.side_effect = write_new_transcript
+                result = processor.step_transcribe_from_audio(
+                    audio_path=str(audio_path),
+                    course_name="Course A",
+                    lesson_title="Lesson 1",
+                    skip_existing=False,
+                )
+
+            self.assertTrue(result["success"])
+            self.assertFalse(result["skipped"])
+            self.assertFalse(result["exists"])
+            mocked_transcribe.assert_called_once()
+            self.assertTrue(srt_path.exists())
+            self.assertTrue(txt_path.exists())
+            self.assertEqual(txt_path.read_text(encoding="utf-8"), "new transcript")
+
     def test_process_with_gemini_text_uses_openai_provider_when_configured(self):
         response = Mock()
         response.raise_for_status.return_value = None
@@ -125,10 +174,14 @@ class CoreProcessorDownloadTests(unittest.TestCase):
         response.headers = {}
         response.raise_for_status.return_value = None
         response.iter_lines.return_value = [
-            'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
-            'data: {"choices":[{"delta":{"content":"stream "},"finish_reason":null}]}',
-            'data: {"choices":[{"delta":{"content":"note body"},"finish_reason":null}]}',
-            "data: [DONE]",
+            b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"stream "},"finish_reason":null}]}'.encode(
+                "utf-8"
+            ),
+            'data: {"choices":[{"delta":{"content":"中文 note body"},"finish_reason":null}]}'.encode(
+                "utf-8"
+            ),
+            b"data: [DONE]",
         ]
 
         session = Mock()
@@ -156,7 +209,7 @@ class CoreProcessorDownloadTests(unittest.TestCase):
             processor = core_processor.CoreProcessor()
             result = processor.process_with_gemini_text("字幕内容")
 
-        self.assertEqual(result, "stream note body")
+        self.assertEqual(result, "stream 中文 note body")
         self.assertTrue(session.post.call_args.kwargs["json"]["stream"])
         self.assertTrue(session.post.call_args.kwargs["stream"])
         self.assertEqual(session.post.call_args.kwargs["timeout"], (12, 34))

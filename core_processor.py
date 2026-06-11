@@ -1031,7 +1031,7 @@ class CoreProcessor:
             "False",
         }
         self.openai_stream_idle_timeout = int(
-            get_config("OPENAI_STREAM_IDLE_TIMEOUT", 120)
+            get_config("OPENAI_STREAM_IDLE_TIMEOUT", self.openai_timeout)
         )
 
         if self.ai_provider == "openai":
@@ -1519,9 +1519,29 @@ class CoreProcessor:
                         len(content),
                     )
                     return content
-                except requests.RequestException as exc:
+                except requests.exceptions.ReadTimeout as exc:
+                    message = str(exc)
+                    if self.openai_stream:
+                        message = (
+                            "OpenAI 兼容接口流式响应读超时："
+                            f"{self.openai_stream_idle_timeout}s 内没有收到新内容。"
+                            "这通常表示上游模型生成过慢或服务商流式连接空闲过久。"
+                        )
                     if attempt >= self.openai_max_retries:
-                        raise RuntimeError(str(exc)) from exc
+                        raise RuntimeError(message) from exc
+                    logger.warning("%s，准备重试", message)
+                    time.sleep(min(4, attempt * 2))
+                except requests.RequestException as exc:
+                    message = str(exc)
+                    if self.openai_stream and "Read timed out" in message:
+                        message = (
+                            "OpenAI 兼容接口流式响应读超时："
+                            f"{self.openai_stream_idle_timeout}s 内没有收到新内容。"
+                            "这通常表示上游模型生成过慢或服务商流式连接空闲过久。"
+                        )
+                    if attempt >= self.openai_max_retries:
+                        raise RuntimeError(message) from exc
+                    logger.warning("%s，准备重试", message)
                     time.sleep(min(4, attempt * 2))
         finally:
             session.close()
@@ -1543,7 +1563,7 @@ class CoreProcessor:
     def _read_openai_stream(self, response):
         chunks = []
         last_chunk_at = time.monotonic()
-        for raw_line in response.iter_lines(decode_unicode=True):
+        for raw_line in response.iter_lines(decode_unicode=False):
             if time.monotonic() - last_chunk_at > self.openai_stream_idle_timeout:
                 raise RuntimeError(
                     f"OpenAI 兼容接口流式响应超时: {self.openai_stream_idle_timeout}s 内无内容"
@@ -1551,7 +1571,13 @@ class CoreProcessor:
             if not raw_line:
                 continue
 
-            line = raw_line.strip()
+            if isinstance(raw_line, bytes):
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    raise RuntimeError("OpenAI 兼容接口流式响应不是有效 UTF-8") from exc
+            else:
+                line = str(raw_line).strip()
             if line == "data: [DONE]":
                 break
             if not line.startswith("data: "):
@@ -1809,16 +1835,8 @@ class CoreProcessor:
                     "formatted_name": formatted_name,
                 }
             else:
-                return {
-                    "success": True,
-                    "skipped": False,
-                    "exists": True,
-                    "audio_path": audio_path,
-                    "subtitle_path": existing['subtitle_path'],
-                    "transcript_text": existing['transcript_text'],
-                    "formatted_name": formatted_name,
-                    "message": "字幕已存在，请确认是否重新转录"
-                }
+                report("processing", 32, "字幕已存在，准备重新转录...")
+                self._remove_existing_transcript_outputs(formatted_name)
         
         # 3. 执行转录
         report("processing", 35, "正在转录音频...")
@@ -1850,6 +1868,19 @@ class CoreProcessor:
             logger.error(f"转录失败: {e}")
             report("error", 0, f"转录失败: {e}")
             return {"success": False, "error": str(e)}
+
+    def _remove_existing_transcript_outputs(self, formatted_name: str) -> None:
+        """删除旧字幕输出，确保强制重新转录会实际覆盖。"""
+        for base_dir in [DOWNLOAD_DIR, TEMP_DIR]:
+            base_path = Path(base_dir)
+            for suffix in [".srt", ".txt", ".srt.tmp", ".txt.tmp"]:
+                target = base_path / f"{formatted_name}{suffix}"
+                if target.exists():
+                    try:
+                        target.unlink()
+                        logger.info("已删除旧字幕文件: %s", target)
+                    except OSError as exc:
+                        raise RuntimeError(f"删除旧字幕文件失败: {target}: {exc}") from exc
 
     def step_transcribe_from_audio(self, audio_path, course_name, lesson_title,
                                    skip_existing=False, progress_callback=None, cancel_callback=None):
@@ -1905,16 +1936,8 @@ class CoreProcessor:
                     "formatted_name": formatted_name,
                 }
             else:
-                return {
-                    "success": True,
-                    "skipped": False,
-                    "exists": True,
-                    "audio_path": audio_path,
-                    "subtitle_path": existing['subtitle_path'],
-                    "transcript_text": existing['transcript_text'],
-                    "formatted_name": formatted_name,
-                    "message": "字幕已存在，请确认是否重新转录"
-                }
+                report("processing", 28, "字幕已存在，准备重新转录...")
+                self._remove_existing_transcript_outputs(formatted_name)
         
         # 执行转录
         report("processing", 30, "正在转录音频...")
